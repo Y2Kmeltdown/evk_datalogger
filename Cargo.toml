@@ -1,0 +1,7 @@
+[package]
+name = "evk_datalogger"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+neuromorphic-drivers = "0.17.0"
