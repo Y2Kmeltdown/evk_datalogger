@@ -30,7 +30,7 @@ struct Args {
     output_dir: PathBuf,
 
     /// How often (in seconds) to roll over to a new raw output file
-    #[arg(long, default_value_t = 300)]
+    #[arg(long, default_value_t = 60)]
     file_interval_secs: u64,
 }
 
@@ -280,6 +280,10 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
                     trigger_count += 1;
                 },
             );
+
+            let state = adapter.state();
+            //eprintln!("{state:?}");
+            
 
             // ── Write raw bytes to file ───────────────────────────────────────
             let len = packet.raw_bytes.len() as u32;
