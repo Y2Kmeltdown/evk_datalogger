@@ -30,14 +30,77 @@ struct Args {
     output_dir: PathBuf,
 
     /// How often (in seconds) to roll over to a new raw output file
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 300)]
     file_interval_secs: u64,
 }
 
-// ── Data ──────────────────────────────────────────────────────────────────────
+// ── Binary event structs ──────────────────────────────────────────────────────
+//
+// Each struct is serialised as a tightly-packed, little-endian byte sequence.
+// The layout is fixed and documented here so the Python client can unpack it
+// with a single `struct.unpack` call.
+//
+// DvsEvent  — 13 bytes
+//   t      : u64  (8 bytes, little-endian) — sensor timestamp in microseconds
+//   x      : u16  (2 bytes, little-endian) — pixel column
+//   y      : u16  (2 bytes, little-endian) — pixel row
+//   on     : u8   (1 byte)                 — 1 = ON polarity, 0 = OFF
+//
+// TriggerEvent — 33 bytes
+//   system_time      : u64  (8 bytes, little-endian)
+//   system_timestamp : u64  (8 bytes, little-endian)
+//   t                : u64  (8 bytes, little-endian) — sensor timestamp
+//   id               : u8   (1 byte)                 — trigger channel ID
+//   rising           : u8   (1 byte)                 — 1 = rising, 0 = falling
+//   _pad             : u8   (6 bytes)                — reserved, always 0
 
-/// Owned packet: raw bytes copied out of the BufferView, plus the index data
-/// captured at the moment of ingestion. No borrows — safe to send across threads.
+const DVS_EVENT_SIZE: usize = 13;
+const TRIGGER_EVENT_SIZE: usize = 26;
+
+struct DvsEvent {
+    t: u64,
+    x: u16,
+    y: u16,
+    on: u8,
+}
+
+impl DvsEvent {
+    /// Serialise to a fixed-size byte array — no heap allocation.
+    fn to_bytes(&self) -> [u8; DVS_EVENT_SIZE] {
+        let mut buf = [0u8; DVS_EVENT_SIZE];
+        buf[0..8].copy_from_slice(&self.t.to_le_bytes());
+        buf[8..10].copy_from_slice(&self.x.to_le_bytes());
+        buf[10..12].copy_from_slice(&self.y.to_le_bytes());
+        buf[12] = self.on;
+        buf
+    }
+}
+
+struct TriggerEvent {
+    system_time: u64,
+    system_timestamp: u64,
+    t: u64,
+    id: u8,
+    rising: u8,
+}
+
+impl TriggerEvent {
+    /// Serialise to a fixed-size byte array — no heap allocation.
+    fn to_bytes(&self) -> [u8; TRIGGER_EVENT_SIZE] {
+        let mut buf = [0u8; TRIGGER_EVENT_SIZE];
+        buf[0..8].copy_from_slice(&self.system_time.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.system_timestamp.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.t.to_le_bytes());
+        buf[24] = self.id;
+        buf[25] = self.rising;
+        buf
+    }
+}
+
+// ── Owned pipeline packet ─────────────────────────────────────────────────────
+
+/// Raw bytes copied out of the BufferView plus index data captured at ingestion.
+/// No borrows — safe to send across threads.
 struct OwnedPacket {
     raw_bytes: Vec<u8>,
     index_data: [u8; 16],
@@ -64,29 +127,23 @@ fn open_raw_file(dir: &Path) -> std::fs::File {
         .unwrap_or_else(|e| panic!("Failed to open raw file {}: {e}", path.display()))
 }
 
-/// Try to write a length-prefixed message to a stream.
-/// If the write fails (client disconnected), returns the stream slot back as None
-/// so we stop trying to write and wait for a new connection.
+/// Try to write a length-prefixed binary message to a stream.
+/// On write failure (client disconnected) the stream slot is set to None
+/// so the next packet iteration will poll for a fresh connection.
 fn try_send(stream: &mut Option<UnixStream>, data: &[u8]) {
     let Some(s) = stream.as_mut() else { return };
     let len = data.len() as u32;
     let ok = s.write_all(&len.to_le_bytes()).and_then(|_| s.write_all(data));
     if let Err(e) = ok {
         eprintln!("[processor] Socket write error (client disconnected?): {e}");
-        *stream = None; // drop the broken stream; accept_next() will reconnect
+        *stream = None;
     }
 }
 
-/// Poll the listener (non-blocking) for a new client connection.
-/// Returns Some(stream) if one connected this call, None otherwise.
+/// Poll a non-blocking listener for a new client connection.
 fn accept_next(listener: &UnixListener) -> Option<UnixStream> {
     match listener.accept() {
         Ok((stream, _)) => {
-            // Put the accepted stream into non-blocking mode so that writes
-            // to a slow client don't stall the processing thread.
-            stream
-                .set_nonblocking(false) // writes should block briefly; reads never happen
-                .expect("set_nonblocking failed");
             println!("[processor] New socket client connected.");
             Some(stream)
         }
@@ -107,8 +164,6 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
     let _ = std::fs::remove_file(&args.events_socket);
     let _ = std::fs::remove_file(&args.triggers_socket);
 
-    // Set both listeners to non-blocking so accept() returns immediately
-    // when no client is waiting rather than blocking the processing thread.
     let events_listener = UnixListener::bind(&args.events_socket)
         .expect("Failed to bind events socket");
     events_listener
@@ -152,13 +207,14 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
 
     // ── Processing thread ─────────────────────────────────────────────────────
     let processor = thread::spawn(move || {
-        let mut events_bytes: Vec<u8> = Vec::new();
-        let mut triggers_bytes: Vec<u8> = Vec::new();
+        // Reusable buffers — cleared each packet, grown as needed, never reallocated
+        // once they reach steady-state capacity.
+        let mut events_buf: Vec<u8> = Vec::new();
+        let mut triggers_buf: Vec<u8> = Vec::new();
 
         let mut raw_file = open_raw_file(&output_dir);
         let mut last_rollover = Instant::now();
 
-        // Streams start as None — populated when a client connects.
         let mut events_stream: Option<UnixStream> = None;
         let mut triggers_stream: Option<UnixStream> = None;
 
@@ -170,9 +226,7 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
         let mut total_trigger_events: u64 = 0;
 
         while let Ok(packet) = rx.recv() {
-            // ── Accept new clients if none are connected ───────────────────────
-            // These are non-blocking polls — they return immediately if nobody
-            // is waiting, so they never stall the processing loop.
+            // ── Accept new clients if none connected ──────────────────────────
             if events_stream.is_none() {
                 events_stream = accept_next(&events_listener);
             }
@@ -180,7 +234,7 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
                 triggers_stream = accept_next(&triggers_listener);
             }
 
-            // ── File rollover check ───────────────────────────────────────────
+            // ── File rollover ─────────────────────────────────────────────────
             if last_rollover.elapsed() >= file_interval {
                 raw_file = open_raw_file(&output_dir);
                 last_rollover = Instant::now();
@@ -199,27 +253,30 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
                 packet.index_data[8..16].try_into().expect("8 bytes"),
             );
 
-            events_bytes.clear();
-            triggers_bytes.clear();
+            events_buf.clear();
+            triggers_buf.clear();
 
             adapter.convert(
                 &packet.raw_bytes,
                 |dvs_event| {
-                    let t = dvs_event.t;
-                    let x = dvs_event.x;
-                    let y = dvs_event.y;
-                    let on = dvs_event.polarity as u8;
-                    events_bytes.extend(format!("{t},{x},{y},{on}\n").as_bytes());
+                    let event = DvsEvent {
+                        t: dvs_event.t,
+                        x: dvs_event.x,
+                        y: dvs_event.y,
+                        on: dvs_event.polarity as u8,
+                    };
+                    events_buf.extend_from_slice(&event.to_bytes());
                     dvs_count += 1;
                 },
                 |trigger_event| {
-                    let t = trigger_event.t;
-                    let id = trigger_event.id;
-                    let rising = trigger_event.polarity as u8;
-                    triggers_bytes.extend(
-                        format!("{system_time},{system_timestamp},{t},{id},{rising}\n")
-                            .as_bytes(),
-                    );
+                    let event = TriggerEvent {
+                        system_time,
+                        system_timestamp,
+                        t: trigger_event.t,
+                        id: trigger_event.id,
+                        rising: trigger_event.polarity as u8,
+                    };
+                    triggers_buf.extend_from_slice(&event.to_bytes());
                     trigger_count += 1;
                 },
             );
@@ -233,14 +290,12 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
                 eprintln!("[processor] Raw file write error: {e}");
             }
 
-            // ── Send decoded events over unix sockets ─────────────────────────
-            // try_send is a no-op when the stream is None (no client connected)
-            // and sets it back to None if the client has disconnected.
-            if !events_bytes.is_empty() {
-                try_send(&mut events_stream, &events_bytes);
+            // ── Send binary events over unix sockets ──────────────────────────
+            if !events_buf.is_empty() {
+                try_send(&mut events_stream, &events_buf);
             }
-            if !triggers_bytes.is_empty() {
-                try_send(&mut triggers_stream, &triggers_bytes);
+            if !triggers_buf.is_empty() {
+                try_send(&mut triggers_stream, &triggers_buf);
             }
 
             #[cfg(debug_assertions)]
