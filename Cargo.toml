@@ -7,3 +7,12 @@ edition = "2024"
 neuromorphic-drivers = "0.17.0"
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+
+[[bin]]
+name = "viewfinder"
+path = "src/bin/viewfinder.rs"
+ 
+[[bin]]
+name = "replay"
+path = "src/bin/replay.rs"

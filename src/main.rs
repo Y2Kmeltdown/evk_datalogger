@@ -31,7 +31,7 @@ struct Args {
 
     /// How often (in seconds) to roll over to a new raw output file
     #[arg(long, default_value_t = 60)]
-    file_interval_secs: u64,
+    file_length: u64,
 }
 
 // ── Binary event structs ──────────────────────────────────────────────────────
@@ -179,7 +179,7 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
     println!("[main] Events socket:    {}", args.events_socket.display());
     println!("[main] Triggers socket:  {}", args.triggers_socket.display());
     println!("[main] Output directory: {}", args.output_dir.display());
-    println!("[main] File interval:    {}s", args.file_interval_secs);
+    println!("[main] File interval:    {}s", args.file_length);
     println!("[main] Device starting — socket clients can connect at any time.");
 
     // ── Device setup ──────────────────────────────────────────────────────────
@@ -200,7 +200,7 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
     let mut adapter = device.create_adapter();
 
     let output_dir = args.output_dir.clone();
-    let file_interval = Duration::from_secs(args.file_interval_secs);
+    let file_interval = Duration::from_secs(args.file_length);
 
     // ── Channel ───────────────────────────────────────────────────────────────
     let (tx, rx) = mpsc::channel::<OwnedPacket>();
@@ -281,7 +281,7 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
                 },
             );
 
-            let state = adapter.state();
+            //let state = adapter.state();
             //eprintln!("{state:?}");
             
 
