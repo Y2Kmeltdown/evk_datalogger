@@ -49,10 +49,6 @@ struct Args {
     #[arg(long, default_value = "/tmp/evk4_events.sock")]
     events_socket: String,
 
-    /// Only paint every Nth event — 1 paints all events, 2 paints half, 4 a quarter, etc.
-    /// Useful for reducing paint CPU time when event rate is very high.
-    #[arg(long, default_value_t = 1)]
-    event_stride: usize,
 }
 
 // ── Binary event layout (must match the Rust pipeline) ───────────────────────
@@ -227,9 +223,6 @@ fn main() {
                     {
                         let mut px = shared_pixels.lock().unwrap();
                         for i in 0..n_events {
-                            if i % args.event_stride != 0 {
-                                continue;
-                            }
                             let offset = i * DVS_EVENT_SIZE;
                             let chunk = &payload_buf[offset..offset + DVS_EVENT_SIZE];
 
