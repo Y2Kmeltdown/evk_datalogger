@@ -437,7 +437,11 @@ header{
                  oninput="document.getElementById('live-q-val').textContent=this.value">
         </div>
       </div>
-      <button class="apply-btn" onclick="applyVF('live')">↺ APPLY &amp; RESTART</button>
+      <div style="display:flex;gap:6px;margin-top:4px">
+        <button class="apply-btn" style="flex:2" onclick="applyVF('live')">↺ APPLY &amp; RESTART</button>
+        <button class="apply-btn" style="flex:1;border-color:var(--accent);color:var(--accent)" onclick="startVF('live')">▶</button>
+        <button class="apply-btn" style="flex:1;border-color:var(--warn);color:var(--warn);background:var(--warn-dim)" onclick="stopVF('live')">■</button>
+      </div>
     </div>
 
     <!-- Replay settings — hidden until replay is selected -->
@@ -470,8 +474,7 @@ header{
                  oninput="document.getElementById('replay-q-val').textContent=this.value">
         </div>
       </div>
-      <button class="apply-btn" style="border-color:var(--warn);color:var(--warn);background:var(--warn-dim)"
-              onclick="applyVF('replay')">↺ APPLY &amp; RESTART</button>
+
     </div>
   </div>
 
@@ -534,6 +537,32 @@ function setView(mode) {
   // Show only the relevant settings panel
   document.getElementById('panel-live').classList.toggle('visible',  isLive);
   document.getElementById('panel-replay').classList.toggle('visible', !isLive);
+}
+
+// ── Start / stop viewfinder ───────────────────────────────────────────────────
+async function startVF(mode) {
+  const params = {
+    fps:     parseInt(document.getElementById(`${mode}-fps`).value),
+    quality: parseInt(document.getElementById(`${mode}-quality`).value),
+    width:   parseInt(document.getElementById(`${mode}-width`).value),
+    height:  parseInt(document.getElementById(`${mode}-height`).value),
+  };
+  const res  = await fetch(`/api/viewfinder/${mode}/start`, {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(params),
+  });
+  const data = await res.json();
+  if (!res.ok) { toast(data.error || 'Failed to start viewfinder', 'err'); return; }
+  toast(`${mode.toUpperCase()} viewfinder started`, 'ok');
+  updateVFStatus(mode, true);
+  if (mode === currentView) { const f = document.getElementById('vf-frame'); f.src = f.src; }
+}
+
+async function stopVF(mode) {
+  await fetch(`/api/viewfinder/${mode}/stop`, { method: 'POST' });
+  toast(`${mode.toUpperCase()} viewfinder stopped`);
+  updateVFStatus(mode, false);
 }
 
 // ── Apply & restart viewfinder ────────────────────────────────────────────────
@@ -629,12 +658,34 @@ async function startReplay(filename) {
 
   if (playingFile === filename) {
     await fetch('/api/replay/stop', { method: 'POST' });
+    await fetch('/api/viewfinder/replay/stop', { method: 'POST' });
     playingFile = null;
+    updateVFStatus('replay', false);
     loadRecordings();
     toast('Replay stopped.');
     return;
   }
 
+  // Start the replay viewfinder with current settings before launching the file
+  const vfParams = {
+    fps:     parseInt(document.getElementById('replay-fps').value),
+    quality: parseInt(document.getElementById('replay-quality').value),
+    width:   parseInt(document.getElementById('replay-width').value),
+    height:  parseInt(document.getElementById('replay-height').value),
+  };
+  const vfRes = await fetch('/api/viewfinder/replay/start', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify(vfParams),
+  });
+  if (!vfRes.ok) {
+    const vfData = await vfRes.json();
+    toast(vfData.error || 'Failed to start replay viewfinder', 'err');
+    return;
+  }
+  updateVFStatus('replay', true);
+
+  // Then start the replay file
   const res  = await fetch('/api/replay/start', {
     method: 'POST',
     headers: {'Content-Type':'application/json'},
@@ -696,7 +747,7 @@ def main():
     print(f"[dashboard] Serving at:           http://{args.host}:{args.port}")
 
     # Auto-start both viewfinders with default config
-    for mode in ("live", "replay"):
+    for mode in ("live",):
         proc, err = start_viewfinder(mode, vf_configs[mode])
         if err:
             print(f"[dashboard] WARNING: could not auto-start {mode} viewfinder: {err}")
