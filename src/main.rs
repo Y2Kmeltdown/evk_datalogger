@@ -341,7 +341,7 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
             let _ = flag.load_error();
 
             if flag.load_warning().is_some() {
-                eprintln!("[ingester] USB circular buffer overflow");
+                println!("[ingester] USB circular buffer overflow");
             }
         }
     });
