@@ -24,7 +24,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "replay", about = "Replay a raw EVK4 recording over Unix sockets")]
 struct Args {
-    /// Path to the raw .bin recording file
+    /// Path to the raw .raw recording file
     recording: PathBuf,
 
     /// Unix socket path for decoded DVS events
@@ -179,11 +179,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut adapter = neuromorphic_drivers::adapters::evt3::Adapter::from_dimensions(1280, 720);
 
     // ── Counters ──────────────────────────────────────────────────────────────
-    let mut packet_count: u64 = 0;
+    let mut chunk_count: u64 = 0;
     let mut total_dvs: u64 = 0;
     let mut total_triggers: u64 = 0;
 
-    // Reusable encode buffers.
+    // Reusable encode buffers — cleared each chunk.
     let mut events_buf: Vec<u8> = Vec::new();
     let mut triggers_buf: Vec<u8> = Vec::new();
 
@@ -191,31 +191,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let system_timestamp: u64 = 0;
 
     // ── Real-time pacer — initialised on the first event seen ─────────────────
-    // Using Option so we can lazily construct it with the first sensor timestamp,
-    // avoiding any dependency on the recording having a known start time.
     let mut pacer: Option<Pacer> = None;
 
     // ── Read loop ─────────────────────────────────────────────────────────────
-    let mut len_buf = [0u8; 4];
+    // Read the file in fixed-size chunks. The EVT3 adapter is stateful and
+    // handles events that span chunk boundaries correctly, so chunk size only
+    // affects how often we pace and publish — not correctness.
+    let mut chunk = vec![0u8; 131072];
 
     loop {
-        match file.read_exact(&mut len_buf) {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+        let n = match file.read(&mut chunk) {
+            Ok(0) => break,  // clean EOF
+            Ok(n) => n,
             Err(e) => return Err(e.into()),
-        }
+        };
 
-        let payload_len = u32::from_le_bytes(len_buf) as usize;
-        let mut raw = vec![0u8; payload_len];
-        file.read_exact(&mut raw)?;
-
-        packet_count += 1;
+        chunk_count += 1;
         let mut dvs_count = 0u64;
         let mut trigger_count = 0u64;
 
-        // Each closure gets its own timestamp tracker — Rust won't allow two
-        // closures to mutably borrow the same variable simultaneously.
-        // We merge them into a single high-water mark after convert() returns.
+        // Separate timestamp trackers per closure — two closures cannot both
+        // mutably borrow the same variable simultaneously in Rust.
         let mut dvs_last_t: Option<u64>     = None;
         let mut trigger_last_t: Option<u64> = None;
 
@@ -223,7 +219,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         triggers_buf.clear();
 
         adapter.convert(
-            &raw,
+            &chunk[..n],
             |dvs_event| {
                 let bytes = dvs_to_bytes(
                     dvs_event.t,
@@ -250,18 +246,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         // Take the latest timestamp across both event types as the pace target.
-        let packet_last_t = std::cmp::max(dvs_last_t, trigger_last_t);
+        let chunk_last_t = std::cmp::max(dvs_last_t, trigger_last_t);
 
         // ── Real-time pacing ──────────────────────────────────────────────────
-        if let Some(last_t) = packet_last_t {
-            // Initialise the pacer anchor on the very first event.
+        if let Some(last_t) = chunk_last_t {
             let p = pacer.get_or_insert_with(|| {
                 println!("[replay] First event timestamp: {last_t} µs — starting pacer.");
                 Pacer::new(last_t, args.speed)
             });
-
-            // Block here until wall time has caught up to this packet's
-            // sensor timestamp, scaled by --speed.
             p.wait_until(last_t);
         }
 
@@ -283,17 +275,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         total_triggers += trigger_count;
 
         eprintln!(
-            "[replay] packet={packet_count:>6} | \
+            "[replay] chunk={chunk_count:>6} | \
              dvs={dvs_count:>6} (total={total_dvs}) | \
              triggers={trigger_count} (total={total_triggers}) | \
-             raw_bytes={payload_len}"
+             bytes_read={n}"
         );
     }
 
     println!(
-        "[replay] Complete — {packet_count} packets, {total_dvs} DVS events, \
+        "[replay] Complete — {chunk_count} chunks, {total_dvs} DVS events, \
          {total_triggers} trigger events."
     );
-
     Ok(())
 }

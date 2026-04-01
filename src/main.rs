@@ -108,16 +108,16 @@ struct OwnedPacket {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Build a timestamped filename inside `dir`, e.g. `20240315T123456Z.bin`.
-fn timestamped_path(dir: &Path) -> PathBuf {
+/// Build a timestamped filename inside `dir`, e.g. `20240315T123456Z.raw`.
+fn timestamped_path(dir: &Path, ext: String) -> PathBuf {
     let ts = Utc::now().format("%Y%m%dT%H%M%SZ");
-    dir.join(format!("{ts}.raw"))
+    dir.join(format!("{ts}{ext}"))
 }
 
 /// Open a new raw output file, creating the directory if needed.
 fn open_raw_file(dir: &Path) -> std::fs::File {
     std::fs::create_dir_all(dir).expect("Failed to create output directory");
-    let path = timestamped_path(dir);
+    let path = timestamped_path(dir, String::from(".raw"));
     println!("[processor] New raw file: {}", path.display());
     std::fs::OpenOptions::new()
         .create(true)
@@ -287,16 +287,8 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
                 },
             );
 
-            //let state = adapter.state();
-            //eprintln!("{state:?}");
-            
-
             // ── Write raw bytes to file ───────────────────────────────────────
-            let len = packet.raw_bytes.len() as u32;
-            if let Err(e) = raw_file
-                .write_all(&len.to_le_bytes())
-                .and_then(|_| raw_file.write_all(&packet.raw_bytes))
-            {
+            if let Err(e) = raw_file.write_all(&packet.raw_bytes) {
                 eprintln!("[processor] Raw file write error: {e}");
             }
 
@@ -328,9 +320,8 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
     // ── Ingestion thread ──────────────────────────────────────────────────────
     let ingester = thread::spawn(move || {
         loop {
-            if let Some(buffer_view) =
-                device.next_with_timeout(&Duration::from_millis(100))
-            {
+            let buffer_view = device.next_with_timeout(&std::time::Duration::from_millis(100));
+            if let Some(buffer_view) = buffer_view {
 
                 let now_us = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
