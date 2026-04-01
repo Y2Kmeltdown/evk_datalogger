@@ -187,7 +187,7 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
 
     let mut evk_configuration = neuromorphic_drivers::prophesee_evk4::DEFAULT_CONFIGURATION;
     evk_configuration.biases.diff_on = 73;
-    evk_configuration.biases.diff_on = 102;
+    evk_configuration.biases.diff_off = 102;
 
     let device = neuromorphic_drivers::prophesee_evk4::open(
         neuromorphic_drivers::SerialOrBusNumberAndAddress::None,
@@ -196,6 +196,12 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
         event_loop,
         flag.clone(),
     )?;
+
+    // Method of updating configuration
+    // let mut test_configuration = neuromorphic_drivers::prophesee_evk4::DEFAULT_CONFIGURATION;
+    // test_configuration.biases.diff_on = 73;
+    // test_configuration.biases.diff_on = 102;
+    // device.update_configuration(test_configuration);
 
     let mut adapter = device.create_adapter();
 
@@ -321,12 +327,22 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
 
     // ── Ingestion thread ──────────────────────────────────────────────────────
     let ingester = thread::spawn(move || {
-        let index_data: [u8; 16] = [0u8; 16];
-
         loop {
             if let Some(buffer_view) =
                 device.next_with_timeout(&Duration::from_millis(100))
             {
+
+                let now_us = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_micros() as u64;
+                let delay_us = buffer_view.delay().as_micros() as u64;
+                let system_timestamp_us = now_us.saturating_sub(delay_us);
+
+                let mut index_data = [0u8; 16];
+                index_data[0..8].copy_from_slice(&now_us.to_le_bytes());
+                index_data[8..16].copy_from_slice(&system_timestamp_us.to_le_bytes());
+
                 let packet = OwnedPacket {
                     raw_bytes: buffer_view.slice.to_vec(),
                     index_data,
