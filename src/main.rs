@@ -186,7 +186,7 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
     let (flag, event_loop) = neuromorphic_drivers::flag_and_event_loop()?;
 
     let mut evk_configuration = neuromorphic_drivers::prophesee_evk4::DEFAULT_CONFIGURATION;
-    evk_configuration.biases.diff_on = 73;
+    evk_configuration.biases.diff_on = 102;
     evk_configuration.biases.diff_off = 102;
 
     let device = neuromorphic_drivers::prophesee_evk4::open(
