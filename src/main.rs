@@ -108,10 +108,10 @@ struct OwnedPacket {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Build a timestamped filename inside `dir`, e.g. `20240315T123456Z.raw`.
+/// Build a timestamped filename inside `dir`, e.g. `20240315T123456Z_evk.raw`.
 fn timestamped_path(dir: &Path, ext: String) -> PathBuf {
     let ts = Utc::now().format("%Y%m%dT%H%M%SZ");
-    dir.join(format!("{ts}{ext}"))
+    dir.join(format!("{ts}_evk{ext}"))
 }
 
 /// Open a new raw output file, creating the directory if needed.
