@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>EVK4 Live</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #0d0d0d; color: #e0e0e0;
+      font-family: ui-monospace, "Cascadia Code", monospace;
+      display: flex; flex-direction: column; align-items: center;
+      min-height: 100vh; padding: 1.5rem; gap: 1.25rem;
+    }
+    h1    { font-size: 1rem; letter-spacing: 0.15em; color: #7dd3fc; }
+    #feed { max-width: 100%; border: 1px solid #2a2a2a; border-radius: 4px; }
+    .panel {
+      background: #161616; border: 1px solid #2a2a2a; border-radius: 6px;
+      padding: 1rem 1.25rem; width: 100%; max-width: 640px;
+      display: flex; flex-direction: column; gap: 0.8rem;
+    }
+    .row   { display: flex; align-items: center; gap: 0.75rem; }
+    label  { width: 8rem; font-size: 0.78rem; color: #94a3b8; flex-shrink: 0; }
+    input[type=number] {
+      flex: 1; background: #0d0d0d; border: 1px solid #333; border-radius: 3px;
+      color: #e2e8f0; padding: 0.25rem 0.5rem; font-family: inherit; font-size: 0.85rem;
+    }
+    .btns  { display: flex; gap: 0.5rem; align-self: flex-end; }
+    button {
+      padding: 0.4rem 1.1rem; border: none; border-radius: 4px; cursor: pointer;
+      font-family: inherit; font-size: 0.82rem; letter-spacing: 0.05em; transition: background .15s;
+    }
+    #apply       { background: #1e40af; color: #e0f2fe; }
+    #apply:hover { background: #2563eb; }
+    #toggle.on   { background: #dc2626; color: #fff; }
+    #toggle.off  { background: #16a34a; color: #fff; }
+    #status { font-size: 0.75rem; min-height: 1.1em; }
+    .links  { font-size: 0.73rem; color: #475569; }
+    .links a { color: #7dd3fc; text-decoration: none; }
+  </style>
+</head>
+<body>
+  <h1>&#9679; EVK4 LIVE</h1>
+  <img id="feed" src="/stream" alt="live stream"
+       onerror="this.alt='Stream paused or unavailable'">
+
+  <div class="panel">
+    <div class="row">
+      <label>Out width</label>
+      <input type="number" id="out_width" min="1" value="">
+    </div>
+    <div class="row">
+      <label>Out height</label>
+      <input type="number" id="out_height" min="1" value="">
+    </div>
+    <div class="row">
+      <label>Quality (1–100)</label>
+      <input type="number" id="quality" min="1" max="100" value="">
+    </div>
+    <div class="btns">
+      <button id="toggle" class="on">Disable stream</button>
+      <button id="apply">Apply settings</button>
+    </div>
+    <div id="status"></div>
+  </div>
+
+  <p class="links">
+    <a href="/stream">/stream</a> &middot;
+    <a href="/snapshot">/snapshot</a> &middot;
+    <a href="/api/settings">/api/settings</a> &middot;
+    <a href="/api/streaming">/api/streaming</a>
+  </p>
+
+<script>
+  const status = document.getElementById("status");
+  let activeStreaming = true;
+
+  async function loadSettings() {
+    try {
+      const r = await fetch("/api/settings");
+      const d = await r.json();
+      document.getElementById("out_width").value  = d.out_width;
+      document.getElementById("out_height").value = d.out_height;
+      document.getElementById("quality").value    = d.quality;
+    } catch(e) { status.textContent = "Could not load settings: " + e.message; }
+  }
+
+  async function loadStreaming() {
+    try {
+      const r = await fetch("/api/streaming");
+      const d = await r.json();
+      setStreamingUI(d.streaming);
+    } catch(e) {}
+  }
+
+  function setStreamingUI(on) {
+    activeStreaming = on;
+    const btn = document.getElementById("toggle");
+    btn.textContent = on ? "Disable stream" : "Enable stream";
+    btn.className   = on ? "on" : "off";
+    if (on) {
+      const feed = document.getElementById("feed");
+      feed.src = "/stream?" + Date.now();
+    }
+  }
+
+  document.getElementById("apply").addEventListener("click", async () => {
+    const body = {
+      out_width:  parseInt(document.getElementById("out_width").value,  10),
+      out_height: parseInt(document.getElementById("out_height").value, 10),
+      quality:    parseInt(document.getElementById("quality").value,    10),
+    };
+    try {
+      const r = await fetch("/api/settings", {
+        method: "PUT",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (r.ok) {
+        status.style.color = "#86efac";
+        status.textContent = "\u2713 output " + d.out_width + "\u00d7" + d.out_height + "  quality=" + d.quality;
+      } else {
+        status.style.color = "#fca5a5";
+        status.textContent = "Error: " + (d.error || r.statusText);
+      }
+    } catch(e) {
+      status.style.color = "#fca5a5";
+      status.textContent = "Request failed: " + e.message;
+    }
+  });
+
+  document.getElementById("toggle").addEventListener("click", async () => {
+    const next = !activeStreaming;
+    try {
+      const r = await fetch("/api/streaming", {
+        method: "PUT",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({streaming: next}),
+      });
+      const d = await r.json();
+      setStreamingUI(d.streaming);
+      status.style.color = "#86efac";
+      status.textContent = d.streaming ? "Stream enabled." : "Stream disabled.";
+    } catch(e) {
+      status.style.color = "#fca5a5";
+      status.textContent = "Error: " + e.message;
+    }
+  });
+
+  loadSettings();
+  loadStreaming();
+</script>
+</body>
+</html>

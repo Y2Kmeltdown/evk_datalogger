@@ -183,6 +183,7 @@ dependencies = [
  "clap",
  "image",
  "neuromorphic-drivers",
+ "serde",
  "serde_json",
 ]
 
