@@ -39,6 +39,8 @@ use image::imageops::FilterType;
 use image::GrayImage;
 use serde::{Deserialize, Serialize};
 
+use array2d::Array2D;
+
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
 #[derive(Parser, Debug, Clone)]
@@ -341,9 +343,9 @@ fn main() {
 
                 // ── Snapshot pixel buffer (unchanged) ─────────────────────────
                 {
-                    let mut px = shared_pixels.lock().unwrap();
+                    let px = shared_pixels.lock().unwrap();
                     snapshot.copy_from_slice(&px);
-                    px.fill(127);
+                    //px.fill(127);
                 }
 
                 // ── Read current settings atomically ──────────────────────────
@@ -379,6 +381,11 @@ fn main() {
         thread::spawn(move || {
             let mut payload_buf: Vec<u8> = Vec::new();
             let mut len_buf = [0u8; 4];
+
+            let mut next_frame_time:u64 = 0;
+            let increment:u64 = 33333;
+
+            let mut grid: Array2D<u8> = Array2D::filled_with(0, height as usize, width as usize);
 
             loop {
                 println!("[reader] Connecting to {} ...", args.events_socket);
@@ -419,16 +426,26 @@ fn main() {
                         for i in 0..n_events {
                             let offset = i * DVS_EVENT_SIZE;
                             let chunk = &payload_buf[offset..offset + DVS_EVENT_SIZE];
+                            let ts = u64::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7]]);
                             let x  = u16::from_le_bytes([chunk[8],  chunk[9]])  as u32;
                             let y  = u16::from_le_bytes([chunk[10], chunk[11]]) as u32;
                             let on = chunk[12];
 
+                            
                             if x < width && y < height {
-                                px[y as usize * width as usize + x as usize] =
-                                    if on != 0 { 255 } else { 0 };
+                                grid[(y as usize, x as usize)] = if on != 0 { 255 } else { 0 };
+                            }
+
+                            if ts >= next_frame_time {
+                                *px = grid.as_row_major();
+                                grid = Array2D::filled_with(127, height as usize, width as usize);
                                 #[cfg(debug_assertions)]
                                 { painted += 1; }
+
+
+                                next_frame_time = next_frame_time + increment;
                             }
+
                         }
                     }
 
