@@ -533,6 +533,7 @@ fn handle_client(
                 "HTTP/1.1 200 OK\r\n\
                  Content-Type: multipart/x-mixed-replace; boundary={BOUNDARY}\r\n\
                  Cache-Control: no-cache\r\n\
+                 Access-Control-Allow-Origin: *\r\n\
                  Connection: close\r\n\
                  \r\n"
             );
@@ -649,6 +650,16 @@ fn handle_client(
             let on = patch.streaming;
             eprintln!("[api] streaming {}", if on { "enabled" } else { "disabled" });
             json_ok(&mut write_stream, &format!(r#"{{"streaming":{on}}}"#));
+        }
+
+        // ── OPTIONS (CORS preflight) ──────────────────────────────────────────
+        ("OPTIONS", _) => {
+            let header = "HTTP/1.1 204 No Content\r\n\
+                          Access-Control-Allow-Origin: *\r\n\
+                          Access-Control-Allow-Methods: GET, PUT, OPTIONS\r\n\
+                          Access-Control-Allow-Headers: Content-Type\r\n\
+                          \r\n";
+            let _ = write_stream.write_all(header.as_bytes());
         }
 
         // ── 404 ───────────────────────────────────────────────────────────────
