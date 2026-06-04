@@ -218,7 +218,10 @@ fn parse_request(reader: &mut BufReader<std::net::TcpStream>) -> Option<HttpRequ
     reader.read_line(&mut request_line).ok()?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next()?.to_string();
-    let path   = parts.next()?.to_string();
+    // Strip query string — e.g. "/stream?t=1234" → "/stream".
+    // The dashboard appends ?t= for cache-busting; we don't need it server-side.
+    let raw_path = parts.next()?.to_string();
+    let path = raw_path.split('?').next().unwrap_or(&raw_path).to_string();
 
     // Read headers until blank line, collect Content-Length
     let mut content_length = 0usize;
