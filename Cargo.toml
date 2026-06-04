@@ -10,7 +10,6 @@ chrono = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-array2d = "0.3.2"
 
 [[bin]]
 name = "viewfinder"

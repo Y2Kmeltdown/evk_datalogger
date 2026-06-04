@@ -36,10 +36,7 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use image::codecs::jpeg::JpegEncoder;
 use image::imageops::FilterType;
-use image::GrayImage;
 use serde::{Deserialize, Serialize};
-
-use array2d::Array2D;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -160,13 +157,12 @@ fn recv_exact(stream: &mut UnixStream, buf: &mut [u8]) -> std::io::Result<()> {
 /// This is unchanged from the original — it always works on the full sensor
 /// frame and knows nothing about output dimensions.
 fn encode_jpeg(pixels: &[u8], width: u32, height: u32, quality: u8) -> Vec<u8> {
-    let img = GrayImage::from_raw(width, height, pixels.to_vec())
-        .expect("pixel buffer size mismatch");
-    let mut buf = Cursor::new(Vec::new());
-    JpegEncoder::new_with_quality(&mut buf, quality)
-        .encode_image(&img)
+    let mut buf = Vec::with_capacity(pixels.len() / 4);
+    let mut encoder = JpegEncoder::new_with_quality(&mut buf, quality);
+    encoder
+        .encode(pixels, width, height, image::ExtendedColorType::L8)
         .expect("JPEG encoding failed");
-    buf.into_inner()
+    buf
 }
 
 /// Decode a JPEG, resize to (out_width × out_height), re-encode at `quality`.
@@ -344,13 +340,20 @@ fn main() {
             let mut total_encode_us: u64 = 0;
             let mut total_scale_us: u64 = 0;
             let mut total_publish_us: u64 = 0;
+            let mut total_work_us: u64 = 0;
+            let mut last_frame_time = Instant::now();
 
             loop {
-                thread::sleep(frame_interval);
+                // Catch-up sleep: if we're behind, don't sleep at all
+                let elapsed = last_frame_time.elapsed();
+                if elapsed < frame_interval {
+                    thread::sleep(frame_interval - elapsed);
+                }
+                last_frame_time = Instant::now();
 
                 let t0 = Instant::now();
 
-                // ── Snapshot pixel buffer (unchanged) ─────────────────────────
+                // ── Snapshot pixel buffer ─────────────────────────────────────
                 {
                     let px = shared_pixels.lock().unwrap();
                     snapshot.copy_from_slice(&px);
@@ -362,7 +365,7 @@ fn main() {
                     (s.quality, s.out_width, s.out_height)
                 };
 
-                // ── Encode at full sensor resolution (unchanged) ──────────────
+                // ── Encode at full sensor resolution ──────────────────────────
                 let t_encode = Instant::now();
                 let mut jpeg = encode_jpeg(&snapshot, width, height, quality);
                 let encode_us = t_encode.elapsed().as_micros() as u64;
@@ -376,30 +379,34 @@ fn main() {
                     t_scale.elapsed().as_micros() as u64
                 } else { 0 };
 
-                // ── Publish (always, so /snapshot stays fresh) ────────────────
+                // ── Publish ───────────────────────────────────────────────────
                 let t_pub = Instant::now();
                 *latest_frame.lock().unwrap() = Some(jpeg);
                 let publish_us = t_pub.elapsed().as_micros() as u64;
+
+                let work_us = t0.elapsed().as_micros() as u64;
 
                 total_frames += 1;
                 total_encode_us += encode_us;
                 total_scale_us += scale_us;
                 total_publish_us += publish_us;
+                total_work_us += work_us;
 
                 if last_metrics.elapsed() >= Duration::from_secs(1) {
                     let secs = last_metrics.elapsed().as_secs_f64();
                     eprintln!(
-                        "[encoder] {:.0} fps | encode={}µs avg | scale={}µs avg | publish={}µs avg | total={}µs avg",
+                        "[encoder] {:.0} fps | encode={}µs avg | scale={}µs avg | publish={}µs avg | work={}µs avg",
                         total_frames as f64 / secs,
                         total_encode_us / total_frames.max(1),
                         total_scale_us / total_frames.max(1),
                         total_publish_us / total_frames.max(1),
-                        t0.elapsed().as_micros() as u64 / total_frames.max(1),
+                        total_work_us / total_frames.max(1),
                     );
                     total_frames = 0;
                     total_encode_us = 0;
                     total_scale_us = 0;
                     total_publish_us = 0;
+                    total_work_us = 0;
                     last_metrics = Instant::now();
                 }
             }
@@ -415,10 +422,10 @@ fn main() {
             let mut payload_buf: Vec<u8> = Vec::new();
             let mut len_buf = [0u8; 4];
 
-            let mut next_frame_time:u64 = 0;
-            let increment:u64 = 33333;
-
-            let mut grid: Array2D<u8> = Array2D::filled_with(0, height as usize, width as usize);
+            // Pre-allocated grid — no Array2D, no per-frame allocations
+            let mut grid = vec![127u8; n_pixels];
+            let mut last_frame_time = Instant::now();
+            let render_interval = Duration::from_nanos(1_000_000_000 / 30); // 30 fps render
 
             loop {
                 println!("[reader] Connecting to {} ...", args.events_socket);
@@ -439,8 +446,7 @@ fn main() {
                 let mut total_events: u64 = 0;
                 let mut total_bytes: u64 = 0;
                 let mut total_recv_us: u64 = 0;
-                let mut total_paint_us: u64 = 0;
-                let mut total_lock_us: u64 = 0;
+                let mut total_process_us: u64 = 0;
                 let mut total_frames_painted: u64 = 0;
 
                 loop {
@@ -461,61 +467,63 @@ fn main() {
                     }
                     let recv_us = t_recv.elapsed().as_micros() as u64;
 
-                    let t_paint = Instant::now();
+                    let t_process = Instant::now();
                     let mut painted = 0usize;
-                    {
-                        let mut px = shared_pixels.lock().unwrap();
-                        let t_lock = Instant::now();
-                        for i in 0..n_events {
-                            let offset = i * DVS_EVENT_SIZE;
-                            let chunk = &payload_buf[offset..offset + DVS_EVENT_SIZE];
-                            let ts = u64::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7]]);
-                            let x  = u16::from_le_bytes([chunk[8],  chunk[9]])  as u32;
-                            let y  = u16::from_le_bytes([chunk[10], chunk[11]]) as u32;
-                            let on = chunk[12];
 
-                            if x < width && y < height {
-                                grid[(y as usize, x as usize)] = if on != 0 { 255 } else { 0 };
-                            }
+                    // Process events into grid (no mutex — purely local)
+                    for i in 0..n_events {
+                        let offset = i * DVS_EVENT_SIZE;
+                        let chunk = &payload_buf[offset..offset + DVS_EVENT_SIZE];
+                        let _ts = u64::from_le_bytes([
+                            chunk[0], chunk[1], chunk[2], chunk[3],
+                            chunk[4], chunk[5], chunk[6], chunk[7],
+                        ]);
+                        let x = u16::from_le_bytes([chunk[8], chunk[9]]) as u32;
+                        let y = u16::from_le_bytes([chunk[10], chunk[11]]) as u32;
+                        let on = chunk[12];
 
-                            if ts >= next_frame_time {
-                                *px = grid.as_row_major();
-                                grid = Array2D::filled_with(127, height as usize, width as usize);
-                                painted += 1;
-                                next_frame_time = next_frame_time + increment;
-                            }
+                        if x < width && y < height {
+                            grid[(y * width + x) as usize] = if on != 0 { 255 } else { 0 };
                         }
-                        let lock_us = t_lock.elapsed().as_micros() as u64;
-                        total_lock_us += lock_us;
                     }
-                    let paint_us = t_paint.elapsed().as_micros() as u64;
+
+                    // Publish frame on wall-clock timer — independent of event timestamps
+                    if last_frame_time.elapsed() >= render_interval {
+                        {
+                            let mut px = shared_pixels.lock().unwrap();
+                            px.copy_from_slice(&grid);
+                        }
+                        grid.fill(127);
+                        last_frame_time = Instant::now();
+                        painted += 1;
+                    }
+
+                    let process_us = t_process.elapsed().as_micros() as u64;
 
                     total_payloads += 1;
                     total_events += n_events as u64;
                     total_bytes += payload_len as u64;
                     total_recv_us += recv_us;
-                    total_paint_us += paint_us;
+                    total_process_us += process_us;
                     total_frames_painted += painted as u64;
 
                     if last_metrics.elapsed() >= Duration::from_secs(1) {
                         let secs = last_metrics.elapsed().as_secs_f64();
                         eprintln!(
                             "[reader] {:.0} payloads/s | {:.0} events/s | {:.2} MB/s | \
-                             recv={}µs avg | paint={}µs avg | lock={}µs avg | frames={}",
+                             recv={}µs avg | process={}µs avg | frames={}",
                             total_payloads as f64 / secs,
                             total_events as f64 / secs,
                             (total_bytes as f64 / secs) / 1_048_576.0,
                             total_recv_us / total_payloads.max(1),
-                            total_paint_us / total_payloads.max(1),
-                            total_lock_us / total_payloads.max(1),
+                            total_process_us / total_payloads.max(1),
                             total_frames_painted,
                         );
                         total_payloads = 0;
                         total_events = 0;
                         total_bytes = 0;
                         total_recv_us = 0;
-                        total_paint_us = 0;
-                        total_lock_us = 0;
+                        total_process_us = 0;
                         total_frames_painted = 0;
                         last_metrics = Instant::now();
                     }
