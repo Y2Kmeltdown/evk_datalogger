@@ -32,6 +32,10 @@ struct Args {
     /// How often (in seconds) to roll over to a new raw output file
     #[arg(long, default_value_t = 60)]
     file_length: u64,
+
+    /// Hardware event-rate limit (events per second). 0 = unlimited.
+    #[arg(long, default_value_t = 0)]
+    rate_limit: u64,
 }
 
 // ── Binary event structs ──────────────────────────────────────────────────────
@@ -188,6 +192,24 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
     let mut evk_configuration = neuromorphic_drivers::prophesee_evk4::DEFAULT_CONFIGURATION;
     evk_configuration.biases.diff_on = 102;
     evk_configuration.biases.diff_off = 102;
+
+    if args.rate_limit > 0 {
+        // Choose a 1 ms reference period (1000 µs) for smooth hardware limiting.
+        // maximum_events_per_period = rate_limit * (1000 / 1_000_000)
+        let reference_period_us: u16 = 1000;
+        let maximum_events_per_period = (args.rate_limit * reference_period_us as u64) / 1_000_000;
+        let maximum_events_per_period = maximum_events_per_period.max(1) as u32;
+        evk_configuration.rate_limiter = Some(
+            neuromorphic_drivers::prophesee_evk4::RateLimiter {
+                reference_period_us,
+                maximum_events_per_period,
+            },
+        );
+        println!("[main] Hardware rate limiter enabled: {} events/s ({} events per {} µs)",
+            args.rate_limit, maximum_events_per_period, reference_period_us);
+    } else {
+        println!("[main] Hardware rate limiter disabled.");
+    }
 
     let device = neuromorphic_drivers::prophesee_evk4::open(
         neuromorphic_drivers::SerialOrBusNumberAndAddress::None,
