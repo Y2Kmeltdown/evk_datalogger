@@ -338,17 +338,22 @@ fn main() {
         thread::spawn(move || {
             let mut snapshot = vec![0u8; n_pixels];
 
+            // Metrics
+            let mut last_metrics = Instant::now();
+            let mut total_frames: u64 = 0;
+            let mut total_encode_us: u64 = 0;
+            let mut total_scale_us: u64 = 0;
+            let mut total_publish_us: u64 = 0;
+
             loop {
                 thread::sleep(frame_interval);
 
-                #[cfg(debug_assertions)]
                 let t0 = Instant::now();
 
                 // ── Snapshot pixel buffer (unchanged) ─────────────────────────
                 {
                     let px = shared_pixels.lock().unwrap();
                     snapshot.copy_from_slice(&px);
-                    //px.fill(127);
                 }
 
                 // ── Read current settings atomically ──────────────────────────
@@ -358,20 +363,45 @@ fn main() {
                 };
 
                 // ── Encode at full sensor resolution (unchanged) ──────────────
+                let t_encode = Instant::now();
                 let mut jpeg = encode_jpeg(&snapshot, width, height, quality);
+                let encode_us = t_encode.elapsed().as_micros() as u64;
 
                 // ── Scale down if output dimensions differ from source ─────────
-                // This step is entirely post-generation — the pixel accumulation
-                // and encoding above are untouched.
+                let t_scale = Instant::now();
                 if out_width != width || out_height != height {
                     jpeg = scale_jpeg(&jpeg, out_width, out_height, quality);
                 }
+                let scale_us = if out_width != width || out_height != height {
+                    t_scale.elapsed().as_micros() as u64
+                } else { 0 };
 
                 // ── Publish (always, so /snapshot stays fresh) ────────────────
+                let t_pub = Instant::now();
                 *latest_frame.lock().unwrap() = Some(jpeg);
+                let publish_us = t_pub.elapsed().as_micros() as u64;
 
-                #[cfg(debug_assertions)]
-                eprintln!("[encoder] total={:>5}µs  out={}×{}", t0.elapsed().as_micros(), out_width, out_height);
+                total_frames += 1;
+                total_encode_us += encode_us;
+                total_scale_us += scale_us;
+                total_publish_us += publish_us;
+
+                if last_metrics.elapsed() >= Duration::from_secs(1) {
+                    let secs = last_metrics.elapsed().as_secs_f64();
+                    eprintln!(
+                        "[encoder] {:.0} fps | encode={}µs avg | scale={}µs avg | publish={}µs avg | total={}µs avg",
+                        total_frames as f64 / secs,
+                        total_encode_us / total_frames.max(1),
+                        total_scale_us / total_frames.max(1),
+                        total_publish_us / total_frames.max(1),
+                        t0.elapsed().as_micros() as u64 / total_frames.max(1),
+                    );
+                    total_frames = 0;
+                    total_encode_us = 0;
+                    total_scale_us = 0;
+                    total_publish_us = 0;
+                    last_metrics = Instant::now();
+                }
             }
         });
     }
@@ -403,7 +433,18 @@ fn main() {
                 };
                 println!("[reader] Connected.");
 
+                // Per-second metrics
+                let mut last_metrics = Instant::now();
+                let mut total_payloads: u64 = 0;
+                let mut total_events: u64 = 0;
+                let mut total_bytes: u64 = 0;
+                let mut total_recv_us: u64 = 0;
+                let mut total_paint_us: u64 = 0;
+                let mut total_lock_us: u64 = 0;
+                let mut total_frames_painted: u64 = 0;
+
                 loop {
+                    let t_recv = Instant::now();
                     if recv_exact(&mut stream, &mut len_buf).is_err() {
                         eprintln!("[reader] Socket closed — reconnecting.");
                         break;
@@ -418,14 +459,13 @@ fn main() {
                         eprintln!("[reader] Socket closed mid-payload — reconnecting.");
                         break;
                     }
+                    let recv_us = t_recv.elapsed().as_micros() as u64;
 
-                    #[cfg(debug_assertions)]
-                    let paint_start = Instant::now();
-                    #[cfg(debug_assertions)]
+                    let t_paint = Instant::now();
                     let mut painted = 0usize;
-
                     {
                         let mut px = shared_pixels.lock().unwrap();
+                        let t_lock = Instant::now();
                         for i in 0..n_events {
                             let offset = i * DVS_EVENT_SIZE;
                             let chunk = &payload_buf[offset..offset + DVS_EVENT_SIZE];
@@ -434,7 +474,6 @@ fn main() {
                             let y  = u16::from_le_bytes([chunk[10], chunk[11]]) as u32;
                             let on = chunk[12];
 
-                            
                             if x < width && y < height {
                                 grid[(y as usize, x as usize)] = if on != 0 { 255 } else { 0 };
                             }
@@ -442,22 +481,44 @@ fn main() {
                             if ts >= next_frame_time {
                                 *px = grid.as_row_major();
                                 grid = Array2D::filled_with(127, height as usize, width as usize);
-                                #[cfg(debug_assertions)]
-                                { painted += 1; }
-
-
+                                painted += 1;
                                 next_frame_time = next_frame_time + increment;
                             }
-
                         }
+                        let lock_us = t_lock.elapsed().as_micros() as u64;
+                        total_lock_us += lock_us;
                     }
+                    let paint_us = t_paint.elapsed().as_micros() as u64;
 
-                    #[cfg(debug_assertions)]
-                    eprintln!(
-                        "[reader]  payload={payload_len:>7} B | events={n_events:>6} | \
-                         painted={painted:>6} | paint={paint_us:>5}µs",
-                        paint_us = paint_start.elapsed().as_micros(),
-                    );
+                    total_payloads += 1;
+                    total_events += n_events as u64;
+                    total_bytes += payload_len as u64;
+                    total_recv_us += recv_us;
+                    total_paint_us += paint_us;
+                    total_frames_painted += painted as u64;
+
+                    if last_metrics.elapsed() >= Duration::from_secs(1) {
+                        let secs = last_metrics.elapsed().as_secs_f64();
+                        eprintln!(
+                            "[reader] {:.0} payloads/s | {:.0} events/s | {:.2} MB/s | \
+                             recv={}µs avg | paint={}µs avg | lock={}µs avg | frames={}",
+                            total_payloads as f64 / secs,
+                            total_events as f64 / secs,
+                            (total_bytes as f64 / secs) / 1_048_576.0,
+                            total_recv_us / total_payloads.max(1),
+                            total_paint_us / total_payloads.max(1),
+                            total_lock_us / total_payloads.max(1),
+                            total_frames_painted,
+                        );
+                        total_payloads = 0;
+                        total_events = 0;
+                        total_bytes = 0;
+                        total_recv_us = 0;
+                        total_paint_us = 0;
+                        total_lock_us = 0;
+                        total_frames_painted = 0;
+                        last_metrics = Instant::now();
+                    }
                 }
             }
         });
@@ -546,6 +607,12 @@ fn handle_client(
 
             let mut last_sent = Instant::now();
 
+            // Per-client metrics
+            let mut last_metrics = Instant::now();
+            let mut total_frames: u64 = 0;
+            let mut total_lock_clone_us: u64 = 0;
+            let mut total_write_us: u64 = 0;
+
             loop {
                 // Honour the streaming gate — pause without dropping the connection
                 if !settings.read().unwrap().streaming {
@@ -558,13 +625,36 @@ fn handle_client(
                     thread::sleep(frame_interval - elapsed);
                 }
 
+                let t0 = Instant::now();
                 let frame = latest_frame.lock().unwrap().clone();
+                let lock_clone_us = t0.elapsed().as_micros() as u64;
+
                 if let Some(jpeg) = frame {
                     let part = mjpeg_part(&jpeg);
+                    let t1 = Instant::now();
                     if write_stream.write_all(&part).is_err() {
                         break;
                     }
+                    let write_us = t1.elapsed().as_micros() as u64;
                     last_sent = Instant::now();
+
+                    total_frames += 1;
+                    total_lock_clone_us += lock_clone_us;
+                    total_write_us += write_us;
+
+                    if last_metrics.elapsed() >= Duration::from_secs(1) {
+                        let secs = last_metrics.elapsed().as_secs_f64();
+                        eprintln!(
+                            "[stream] {:.0} fps | lock+clone={}µs avg | write={}µs avg",
+                            total_frames as f64 / secs,
+                            total_lock_clone_us / total_frames.max(1),
+                            total_write_us / total_frames.max(1),
+                        );
+                        total_frames = 0;
+                        total_lock_clone_us = 0;
+                        total_write_us = 0;
+                        last_metrics = Instant::now();
+                    }
                 }
             }
         }

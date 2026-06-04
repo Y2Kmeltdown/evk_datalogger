@@ -224,12 +224,14 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
         let mut events_stream: Option<UnixStream> = None;
         let mut triggers_stream: Option<UnixStream> = None;
 
-        #[cfg(debug_assertions)]
-        let mut packet_count: u64 = 0;
-        #[cfg(debug_assertions)]
+        let mut last_metrics = Instant::now();
+        let mut total_packets: u64 = 0;
         let mut total_dvs_events: u64 = 0;
-        #[cfg(debug_assertions)]
         let mut total_trigger_events: u64 = 0;
+        let mut total_raw_bytes: u64 = 0;
+        let mut total_decode_us: u64 = 0;
+        let mut total_file_write_us: u64 = 0;
+        let mut total_socket_send_us: u64 = 0;
 
         while let Ok(packet) = rx.recv() {
             // ── Accept new clients if none connected ──────────────────────────
@@ -262,6 +264,7 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
             events_buf.clear();
             triggers_buf.clear();
 
+            let t_decode = Instant::now();
             adapter.convert(
                 &packet.raw_bytes,
                 |dvs_event| {
@@ -286,31 +289,55 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
                     trigger_count += 1;
                 },
             );
+            let decode_us = t_decode.elapsed().as_micros() as u64;
 
             // ── Write raw bytes to file ───────────────────────────────────────
+            let t_file = Instant::now();
             if let Err(e) = raw_file.write_all(&packet.raw_bytes) {
                 eprintln!("[processor] Raw file write error: {e}");
             }
+            let file_write_us = t_file.elapsed().as_micros() as u64;
 
             // ── Send binary events over unix sockets ──────────────────────────
+            let t_socket = Instant::now();
             if !events_buf.is_empty() {
                 try_send(&mut events_stream, &events_buf);
             }
             if !triggers_buf.is_empty() {
                 try_send(&mut triggers_stream, &triggers_buf);
             }
+            let socket_send_us = t_socket.elapsed().as_micros() as u64;
 
-            #[cfg(debug_assertions)]
-            {
-                total_dvs_events += dvs_count;
-                total_trigger_events += trigger_count;
+            // ── Metrics ───────────────────────────────────────────────────────
+            total_packets += 1;
+            total_dvs_events += dvs_count;
+            total_trigger_events += trigger_count;
+            total_raw_bytes += packet.raw_bytes.len() as u64;
+            total_decode_us += decode_us;
+            total_file_write_us += file_write_us;
+            total_socket_send_us += socket_send_us;
+
+            if last_metrics.elapsed() >= Duration::from_secs(1) {
+                let secs = last_metrics.elapsed().as_secs_f64();
                 eprintln!(
-                    "[processor] packet={packet_count:>6} | \
-                     dvs={dvs_count:>6} (total={total_dvs_events}) | \
-                     triggers={trigger_count} (total={total_trigger_events}) | \
-                     raw_bytes={}",
-                    packet.raw_bytes.len(),
+                    "[processor] {:.0} pkts/s | {:.0} DVS/s | {:.0} trig/s | {:.2} MB/s raw | \
+                     decode={}µs avg | file={}µs avg | socket={}µs avg",
+                    total_packets as f64 / secs,
+                    total_dvs_events as f64 / secs,
+                    total_trigger_events as f64 / secs,
+                    (total_raw_bytes as f64 / secs) / 1_048_576.0,
+                    total_decode_us / total_packets.max(1),
+                    total_file_write_us / total_packets.max(1),
+                    total_socket_send_us / total_packets.max(1),
                 );
+                total_packets = 0;
+                total_dvs_events = 0;
+                total_trigger_events = 0;
+                total_raw_bytes = 0;
+                total_decode_us = 0;
+                total_file_write_us = 0;
+                total_socket_send_us = 0;
+                last_metrics = Instant::now();
             }
         }
 
