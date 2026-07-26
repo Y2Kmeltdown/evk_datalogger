@@ -1,0 +1,58 @@
+{
+  "name": "evk-datalogger",
+  "version": "1.0.0",
+  "description": "Event Camera Datalogger with an MJPEG live-stream server.",
+  "author": "Y2Kmeltdown",
+  "dependencies": {
+    "apt": ["python3-picamera2", "ffmpeg"]
+  },
+  "recordings_subdir": "evk",
+  "arguments": [
+    {
+      "name": "event socket",
+      "flag": "--events-socket",
+      "type": "str",
+      "default": "/tmp/evk4_events.sock",
+      "required": false,
+      "description": "Unix socket for event data published."
+    },
+    {
+      "name": "trigger socket",
+      "flag": "--triggers-socket",
+      "type": "str",
+      "default": "/tmp/evk4_triggers.sock",
+      "required": false,
+      "description": "Unix socket for trigger data published."
+    },
+    {
+      "name": "File Length",
+      "flag": "--file-length",
+      "type": "int",
+      "default": 60,
+      "required": false,
+      "description": "Time in seconds for how long each event recording segment will be"
+    },
+    {
+      "name": "File Length",
+      "flag": "--file-length",
+      "type": "int",
+      "default": 60,
+      "required": false,
+      "description": "Time in seconds for how long each event recording segment will be"
+    },
+    {
+      "name": "File Length",
+      "flag": "--file-length",
+      "type": "int",
+      "default": 60,
+      "required": false,
+      "description": "Time in seconds for how long each event recording segment will be"
+    },
+    {
+      "name": "File Length",
+      "flag": "--file-length",
+      "type": "int",
+      "default": 60,
+      "required": false,
+      "description": "Time in seconds for how long each event recording segment will be"
+    },
