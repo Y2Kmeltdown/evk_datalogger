@@ -1,58 +1,113 @@
 {
   "name": "evk-datalogger",
   "version": "1.0.0",
-  "description": "Event Camera Datalogger with an MJPEG live-stream server.",
+  "description": "EVK4 event camera datalogger with an MJPEG live-stream server (viewfinder).",
   "author": "Y2Kmeltdown",
   "dependencies": {
-    "apt": ["python3-picamera2", "ffmpeg"]
+    "apt": ["build-essential", "pkg-config", "libusb-1.0-0-dev"],
+    "commands": [
+      "{venv_dir}/bin/neuromorphic-drivers-install-udev-rules",
+      "{venv_python} {venv_dir}/lib/python3.*/site-packages/neuromorphic_drivers/udev.py"
+    ]
+  },
+  "install": {
+    "commands": ["cargo build --release"],
+    "artifacts": {
+      "target/release/evk_datalogger": "/usr/local/eventide/code/evk_datalogger",
+      "target/release/viewfinder": "/usr/local/eventide/code/viewfinder"
+    }
   },
   "recordings_subdir": "evk",
   "arguments": [
     {
-      "name": "event socket",
+      "name": "events_socket",
       "flag": "--events-socket",
       "type": "str",
       "default": "/tmp/evk4_events.sock",
       "required": false,
-      "description": "Unix socket for event data published."
+      "description": "Unix socket the datalogger publishes decoded DVS events to."
     },
     {
-      "name": "trigger socket",
+      "name": "triggers_socket",
       "flag": "--triggers-socket",
       "type": "str",
       "default": "/tmp/evk4_triggers.sock",
       "required": false,
-      "description": "Unix socket for trigger data published."
+      "description": "Unix socket the datalogger publishes trigger events to."
     },
     {
-      "name": "File Length",
+      "name": "file_length",
       "flag": "--file-length",
       "type": "int",
       "default": 60,
       "required": false,
-      "description": "Time in seconds for how long each event recording segment will be"
+      "description": "Seconds before rolling over to a new raw recording file."
     },
     {
-      "name": "File Length",
-      "flag": "--file-length",
+      "name": "rate_limit",
+      "flag": "--rate-limit",
       "type": "int",
-      "default": 60,
+      "default": 0,
       "required": false,
-      "description": "Time in seconds for how long each event recording segment will be"
+      "description": "Hardware event-rate limit (events/second). 0 = unlimited."
     },
     {
-      "name": "File Length",
-      "flag": "--file-length",
+      "name": "stream_port",
+      "flag": "--bind",
       "type": "int",
-      "default": 60,
-      "required": false,
-      "description": "Time in seconds for how long each event recording segment will be"
+      "default": 8081,
+      "required": true,
+      "description": "Port the viewfinder MJPEG server binds (nginx proxies /stream/evk/ here)."
     },
     {
-      "name": "File Length",
-      "flag": "--file-length",
+      "name": "stream_quality",
+      "flag": "--quality",
       "type": "int",
-      "default": 60,
+      "default": 15,
       "required": false,
-      "description": "Time in seconds for how long each event recording segment will be"
+      "description": "JPEG quality for the live stream (1-100)."
+    }
+  ],
+  "sockets": [
+    {
+      "name": "events",
+      "type": "unix",
+      "path": "/tmp/evk4_events.sock",
+      "description": "Decoded DVS events: published by event_based_camera, consumed by evk_mjpeg_server and the dashboard backend."
     },
+    {
+      "name": "triggers",
+      "type": "unix",
+      "path": "/tmp/evk4_triggers.sock",
+      "description": "Trigger events published by event_based_camera (see trigger_test.py)."
+    },
+    {
+      "name": "mjpeg_stream",
+      "type": "tcp",
+      "port": 8081,
+      "description": "Viewfinder MJPEG stream plus /api/settings and /api/streaming (proxied by nginx at /stream/evk/ and /settings/evk/)."
+    }
+  ],
+  "programs": [
+    {
+      "name": "event_based_camera",
+      "command": "{install_dir}/evk_datalogger --output-dir {recordings_dir}/evk/ --events-socket {arg:events_socket} --triggers-socket {arg:triggers_socket} --file-length {arg:file_length} --rate-limit {arg:rate_limit}",
+      "directory": "{install_dir}",
+      "autostart": true,
+      "autorestart": true,
+      "startretries": 10000,
+      "priority": 1,
+      "user": "root"
+    },
+    {
+      "name": "evk_mjpeg_server",
+      "command": "{install_dir}/viewfinder --bind 0.0.0.0:{arg:stream_port} --events-socket {arg:events_socket} --quality {arg:stream_quality}",
+      "directory": "{install_dir}",
+      "autostart": true,
+      "autorestart": true,
+      "startretries": 10000,
+      "priority": 2,
+      "user": "root"
+    }
+  ]
+}

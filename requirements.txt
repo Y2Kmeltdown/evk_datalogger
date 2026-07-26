@@ -1,0 +1,8 @@
+# Installed into this module's own virtual environment at install time —
+# see eventide-module.json and the eventide docs (docs/MODULES.md).
+#
+# neuromorphic_drivers provides the udev-rule installer used in
+# dependencies.commands (USB access to the event camera); the Rust binaries
+# themselves link the neuromorphic-drivers crate, not this package.
+neuromorphic_drivers==0.17.0
+faery==0.7.0
