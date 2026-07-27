@@ -13,8 +13,8 @@
   "install": {
     "commands": ["cargo build --release"],
     "artifacts": {
-      "target/release/evk_datalogger": "/usr/local/eventide/code/evk_datalogger",
-      "target/release/viewfinder": "/usr/local/eventide/code/viewfinder"
+      "target/release/evk_datalogger": "{install_dir}/evk_datalogger",
+      "target/release/viewfinder": "{install_dir}/viewfinder"
     }
   },
   "recordings_subdir": "evk",
