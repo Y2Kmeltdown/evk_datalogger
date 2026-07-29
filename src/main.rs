@@ -1,41 +1,108 @@
-use std::io::Write;
+//! EVK4 ingestion pipeline with HTTP API control.
+//!
+//! Streams decoded DVS / trigger events to Unix sockets and records raw data
+//! on demand. Recording is OFF by default and is toggled via the HTTP API.
+//! A circular buffer keeps recent raw history in memory, so a recording that
+//! starts later still contains the moments *before* the record command
+//! (pre-roll). The buffer is bounded by two caps applied together: chunks
+//! older than `max_age_secs` are dropped, and the oldest chunks are dropped
+//! while the total size exceeds `max_bytes`. Setting either cap to 0
+//! effectively disables the buffer.
+//!
+//! HTTP API (default bind: 0.0.0.0:8081)
+//! ─────────────────────────────────────
+//!   GET  /api/status       Full state: recording, file, biases, rate limit, buffer
+//!   GET  /api/recording    {"recording": bool, "current_file": path|null}
+//!   PUT  /api/recording    body: {"recording": true|false}
+//!   GET  /api/biases       Current camera biases (full driver struct)
+//!   PUT  /api/biases       body: any subset of {"diff","diff_on","diff_off",
+//!                          "hpf","refr","pr","fo","inv"} — applied at runtime
+//!   GET  /api/rate-limit   {"events_per_second": n}  (0 = unlimited)
+//!   PUT  /api/rate-limit   body: {"events_per_second": n}
+//!   GET  /api/buffer       Circular buffer caps + live fill stats
+//!   PUT  /api/buffer       body: any subset of {"max_age_secs","max_bytes"}
+
+use std::collections::VecDeque;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use uds_windows::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
-use neuromorphic_drivers::{UsbDevice};
+
+use neuromorphic_drivers::prophesee_evk4;
+use neuromorphic_drivers::UsbDevice;
 
 use chrono::Utc;
 use clap::Parser;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
+/// Base directory for default socket paths and recordings.
+/// `/tmp` on Unix; the per-user temp directory on Windows.
+#[cfg(unix)]
+fn default_tmp_dir() -> PathBuf {
+    PathBuf::from("/tmp")
+}
+
+/// Base directory for default socket paths and recordings.
+/// `/tmp` on Unix; the per-user temp directory on Windows.
+#[cfg(windows)]
+fn default_tmp_dir() -> PathBuf {
+    std::env::temp_dir()
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "evk4-pipeline",
-    about = "Ingest EVK4 events and stream them to Unix sockets while recording raw data"
+    about = "Ingest EVK4 events and stream them to Unix sockets; recording and camera \
+             settings are controlled at runtime via an HTTP API"
 )]
 struct Args {
     /// Unix socket path for decoded DVS events
-    #[arg(long, default_value = "/tmp/evk4_events.sock")]
+    #[arg(long, default_value_os_t = default_tmp_dir().join("evk4_events.sock"))]
     events_socket: PathBuf,
 
     /// Unix socket path for decoded trigger events
-    #[arg(long, default_value = "/tmp/evk4_triggers.sock")]
+    #[arg(long, default_value_os_t = default_tmp_dir().join("evk4_triggers.sock"))]
     triggers_socket: PathBuf,
 
-    /// Directory to write raw recording files into
-    #[arg(long, default_value = "/tmp/evk4_raw")]
+    /// Directory to write raw recording files into (when recording is enabled)
+    #[arg(long, default_value_os_t = default_tmp_dir().join("evk4_raw"))]
     output_dir: PathBuf,
 
-    /// How often (in seconds) to roll over to a new raw output file
+    /// How often (in seconds) to roll over to a new raw file while recording
     #[arg(long, default_value_t = 60)]
     file_length: u64,
 
-    /// Hardware event-rate limit (events per second). 0 = unlimited.
+    /// Initial hardware event-rate limit (events per second). 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     rate_limit: u64,
+
+    /// Initial camera bias: diff_on (ON-event contrast threshold)
+    #[arg(long, default_value_t = 102)]
+    diff_on: u8,
+
+    /// Initial camera bias: diff_off (OFF-event contrast threshold)
+    #[arg(long, default_value_t = 102)]
+    diff_off: u8,
+
+    /// HTTP API bind address
+    #[arg(long, default_value = "0.0.0.0:8081")]
+    api_bind: String,
+
+    /// Circular buffer cap: maximum age (seconds) of retained data. 0 = buffer off.
+    #[arg(long, default_value_t = 10)]
+    buffer_max_age: u64,
+
+    /// Circular buffer cap: maximum total size in bytes. 0 = buffer off.
+    #[arg(long, default_value_t = 100 * 1024 * 1024)]
+    buffer_max_bytes: u64,
 }
 
 // ── Binary event structs ──────────────────────────────────────────────────────
@@ -50,13 +117,12 @@ struct Args {
 //   y      : u16  (2 bytes, little-endian) — pixel row
 //   on     : u8   (1 byte)                 — 1 = ON polarity, 0 = OFF
 //
-// TriggerEvent — 33 bytes
+// TriggerEvent — 26 bytes
 //   system_time      : u64  (8 bytes, little-endian)
 //   system_timestamp : u64  (8 bytes, little-endian)
 //   t                : u64  (8 bytes, little-endian) — sensor timestamp
 //   id               : u8   (1 byte)                 — trigger channel ID
 //   rising           : u8   (1 byte)                 — 1 = rising, 0 = falling
-//   _pad             : u8   (6 bytes)                — reserved, always 0
 
 const DVS_EVENT_SIZE: usize = 13;
 const TRIGGER_EVENT_SIZE: usize = 26;
@@ -119,16 +185,18 @@ fn timestamped_path(dir: &Path, ext: String) -> PathBuf {
 }
 
 /// Open a new raw output file, creating the directory if needed.
-fn open_raw_file(dir: &Path) -> std::fs::File {
+/// Returns the path and the opened file.
+fn open_raw_file(dir: &Path) -> (PathBuf, std::fs::File) {
     std::fs::create_dir_all(dir).expect("Failed to create output directory");
     let path = timestamped_path(dir, String::from(".raw"));
     println!("[processor] New raw file: {}", path.display());
-    std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&path)
-        .unwrap_or_else(|e| panic!("Failed to open raw file {}: {e}", path.display()))
+        .unwrap_or_else(|e| panic!("Failed to open raw file {}: {e}", path.display()));
+    (path, file)
 }
 
 /// Try to write a length-prefixed binary message to a stream.
@@ -159,6 +227,377 @@ fn accept_next(listener: &UnixListener) -> Option<UnixStream> {
     }
 }
 
+/// Build the hardware rate limiter for a user-facing events-per-second limit.
+/// 0 = unlimited (None).
+fn make_rate_limiter(events_per_second: u64) -> Option<prophesee_evk4::RateLimiter> {
+    if events_per_second == 0 {
+        return None;
+    }
+    // Choose a 1 ms reference period (1000 µs) for smooth hardware limiting.
+    // maximum_events_per_period = rate * (1000 / 1_000_000)
+    let reference_period_us: u16 = 1000;
+    let maximum_events_per_period =
+        ((events_per_second * reference_period_us as u64) / 1_000_000).max(1) as u32;
+    Some(prophesee_evk4::RateLimiter {
+        reference_period_us,
+        maximum_events_per_period,
+    })
+}
+
+// ── Shared control state ──────────────────────────────────────────────────────
+
+/// State shared between the HTTP API thread and the pipeline threads.
+///
+/// The atomics are written by the API and read by the processor thread.
+/// `configuration` travels the other way: the API mutates it under the mutex
+/// and forwards clones to the ingester thread, which owns the device and is
+/// therefore the only place `update_configuration` is called.
+struct SharedState {
+    /// Recording on/off — set by the API, consumed by the processor thread.
+    recording: AtomicBool,
+    /// Circular buffer caps — set by the API.
+    buffer_max_age_secs: AtomicU64,
+    buffer_max_bytes: AtomicU64,
+    /// Live buffer fill — written by the processor, read by the API.
+    buffer_bytes: AtomicU64,
+    buffer_chunks: AtomicU64,
+    /// File currently being recorded — written by the processor, read by the API.
+    current_file: Mutex<Option<PathBuf>>,
+    /// Full device configuration holding the current biases and rate limiter.
+    configuration: Mutex<prophesee_evk4::Configuration>,
+    /// User-facing rate limit (events/s, 0 = unlimited) — mirrors the configuration.
+    rate_limit_eps: AtomicU64,
+}
+
+// ── Circular buffer ───────────────────────────────────────────────────────────
+
+/// Bounded history of raw packet bytes.
+///
+/// Every packet is appended; eviction enforces both caps at once — chunks
+/// older than `max_age` are dropped, and the oldest chunks are dropped while
+/// the total size exceeds `max_bytes`. The contents are written as pre-roll
+/// when recording starts.
+struct CircularBuffer {
+    chunks: VecDeque<(Instant, Vec<u8>)>,
+    total_bytes: usize,
+}
+
+impl CircularBuffer {
+    fn new() -> Self {
+        Self {
+            chunks: VecDeque::new(),
+            total_bytes: 0,
+        }
+    }
+
+    fn push(&mut self, data: Vec<u8>) {
+        self.total_bytes += data.len();
+        self.chunks.push_back((Instant::now(), data));
+    }
+
+    fn evict(&mut self, max_age: Duration, max_bytes: usize) {
+        // checked_sub: a huge max_age must not underflow — it just disables
+        // the age cap (cutoff lands before the beginning of time).
+        let cutoff = Instant::now().checked_sub(max_age);
+        while let Some((arrived, data)) = self.chunks.front() {
+            let too_old = cutoff.is_some_and(|c| *arrived < c);
+            if too_old || self.total_bytes > max_bytes {
+                self.total_bytes -= data.len();
+                self.chunks.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+}
+
+// ── HTTP API ──────────────────────────────────────────────────────────────────
+
+/// Minimal parsed HTTP request — enough to route and read a JSON body.
+struct HttpRequest {
+    method: String,
+    path: String,
+    body: Vec<u8>,
+}
+
+/// Parse a request from a `BufReader`. Returns `None` on connection errors.
+fn parse_request(reader: &mut BufReader<TcpStream>) -> Option<HttpRequest> {
+    // Request line — query strings are stripped, we don't use them.
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line).ok()?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next()?.to_string();
+    let raw_path = parts.next()?.to_string();
+    let path = raw_path.split('?').next().unwrap_or(&raw_path).to_string();
+
+    // Headers — only Content-Length matters.
+    let mut content_length = 0usize;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).ok()?;
+        if line.trim_end_matches(['\r', '\n']).is_empty() {
+            break;
+        }
+        let lower = line.to_lowercase();
+        if lower.starts_with("content-length:") {
+            content_length = lower.split(':').nth(1)?.trim().parse().ok()?;
+        }
+    }
+
+    let mut body = vec![0u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body).ok()?;
+    }
+    Some(HttpRequest { method, path, body })
+}
+
+/// Write a complete JSON response; the connection is closed by the caller.
+fn write_json(stream: &mut TcpStream, status: u16, status_text: &str, json: &str) {
+    let header = format!(
+        "HTTP/1.1 {status} {status_text}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         \r\n",
+        json.len()
+    );
+    let _ = stream.write_all(header.as_bytes());
+    let _ = stream.write_all(json.as_bytes());
+}
+
+fn json_err(stream: &mut TcpStream, status: u16, status_text: &str, reason: &str) {
+    let body = format!(r#"{{"error":{}}}"#, serde_json::to_string(reason).unwrap());
+    write_json(stream, status, status_text, &body);
+}
+
+/// Payload for PUT /api/recording.
+#[derive(serde::Deserialize)]
+struct RecordingPatch {
+    recording: bool,
+}
+
+/// Payload for PUT /api/biases — every field optional; only supplied biases change.
+#[derive(serde::Deserialize)]
+struct BiasesPatch {
+    diff: Option<u8>,
+    diff_on: Option<u8>,
+    diff_off: Option<u8>,
+    hpf: Option<u8>,
+    refr: Option<u8>,
+    pr: Option<u8>,
+    fo: Option<u8>,
+    inv: Option<u8>,
+}
+
+/// Payload for PUT /api/rate-limit.
+#[derive(serde::Deserialize)]
+struct RateLimitPatch {
+    events_per_second: u64,
+}
+
+/// Payload for PUT /api/buffer — either cap may be updated alone.
+#[derive(serde::Deserialize)]
+struct BufferPatch {
+    max_age_secs: Option<u64>,
+    max_bytes: Option<u64>,
+}
+
+/// Current recording file as a JSON value (string or null).
+fn current_file_json(shared: &SharedState) -> String {
+    match shared.current_file.lock().unwrap().as_ref() {
+        Some(p) => serde_json::to_string(&p.display().to_string()).unwrap(),
+        None => String::from("null"),
+    }
+}
+
+/// Buffer caps plus live fill stats as a JSON object.
+fn buffer_json(shared: &SharedState) -> String {
+    format!(
+        "{{\"max_age_secs\":{},\"max_bytes\":{},\"bytes\":{},\"chunks\":{}}}",
+        shared.buffer_max_age_secs.load(Ordering::Relaxed),
+        shared.buffer_max_bytes.load(Ordering::Relaxed),
+        shared.buffer_bytes.load(Ordering::Relaxed),
+        shared.buffer_chunks.load(Ordering::Relaxed),
+    )
+}
+
+/// Forward the current shared configuration to the ingester thread, which
+/// applies it to the hardware via `update_configuration`.
+fn push_configuration(
+    shared: &SharedState,
+    config_tx: &mpsc::Sender<prophesee_evk4::Configuration>,
+) {
+    let cfg = shared.configuration.lock().unwrap().clone();
+    if config_tx.send(cfg).is_err() {
+        eprintln!("[api] Ingester thread gone — configuration update dropped.");
+    }
+}
+
+fn handle_api(
+    stream: &mut TcpStream,
+    req: &HttpRequest,
+    shared: &Arc<SharedState>,
+    config_tx: &mpsc::Sender<prophesee_evk4::Configuration>,
+) {
+    match (req.method.as_str(), req.path.as_str()) {
+        ("GET", "/api/status") => {
+            let biases = {
+                let cfg = shared.configuration.lock().unwrap();
+                serde_json::to_string(&cfg.biases).unwrap()
+            };
+            let body = format!(
+                "{{\"recording\":{},\"current_file\":{},\"rate_limit_events_per_second\":{},\
+                 \"biases\":{},\"buffer\":{}}}",
+                shared.recording.load(Ordering::Relaxed),
+                current_file_json(shared),
+                shared.rate_limit_eps.load(Ordering::Relaxed),
+                biases,
+                buffer_json(shared),
+            );
+            write_json(stream, 200, "OK", &body);
+        }
+
+        ("GET", "/api/recording") => {
+            let body = format!(
+                "{{\"recording\":{},\"current_file\":{}}}",
+                shared.recording.load(Ordering::Relaxed),
+                current_file_json(shared),
+            );
+            write_json(stream, 200, "OK", &body);
+        }
+
+        ("PUT", "/api/recording") => match serde_json::from_slice::<RecordingPatch>(&req.body) {
+            Ok(patch) => {
+                shared.recording.store(patch.recording, Ordering::Relaxed);
+                eprintln!(
+                    "[api] recording {}",
+                    if patch.recording { "enabled" } else { "disabled" }
+                );
+                let body = format!("{{\"recording\":{}}}", patch.recording);
+                write_json(stream, 200, "OK", &body);
+            }
+            Err(e) => json_err(stream, 400, "Bad Request", &format!("Invalid JSON: {e}")),
+        },
+
+        ("GET", "/api/biases") => {
+            let cfg = shared.configuration.lock().unwrap();
+            write_json(stream, 200, "OK", &serde_json::to_string(&cfg.biases).unwrap());
+        }
+
+        ("PUT", "/api/biases") => match serde_json::from_slice::<BiasesPatch>(&req.body) {
+            Ok(patch) => {
+                {
+                    let mut cfg = shared.configuration.lock().unwrap();
+                    let b = &mut cfg.biases;
+                    if let Some(v) = patch.diff { b.diff = v; }
+                    if let Some(v) = patch.diff_on { b.diff_on = v; }
+                    if let Some(v) = patch.diff_off { b.diff_off = v; }
+                    if let Some(v) = patch.hpf { b.hpf = v; }
+                    if let Some(v) = patch.refr { b.refr = v; }
+                    if let Some(v) = patch.pr { b.pr = v; }
+                    if let Some(v) = patch.fo { b.fo = v; }
+                    if let Some(v) = patch.inv { b.inv = v; }
+                }
+                push_configuration(shared, config_tx);
+                eprintln!("[api] biases updated");
+                let cfg = shared.configuration.lock().unwrap();
+                write_json(stream, 200, "OK", &serde_json::to_string(&cfg.biases).unwrap());
+            }
+            Err(e) => json_err(stream, 400, "Bad Request", &format!("Invalid JSON: {e}")),
+        },
+
+        ("GET", "/api/rate-limit") => {
+            let body = format!(
+                "{{\"events_per_second\":{}}}",
+                shared.rate_limit_eps.load(Ordering::Relaxed)
+            );
+            write_json(stream, 200, "OK", &body);
+        }
+
+        ("PUT", "/api/rate-limit") => match serde_json::from_slice::<RateLimitPatch>(&req.body) {
+            Ok(patch) => {
+                {
+                    let mut cfg = shared.configuration.lock().unwrap();
+                    cfg.rate_limiter = make_rate_limiter(patch.events_per_second);
+                }
+                shared
+                    .rate_limit_eps
+                    .store(patch.events_per_second, Ordering::Relaxed);
+                push_configuration(shared, config_tx);
+                eprintln!("[api] rate limit: {} events/s", patch.events_per_second);
+                let body = format!("{{\"events_per_second\":{}}}", patch.events_per_second);
+                write_json(stream, 200, "OK", &body);
+            }
+            Err(e) => json_err(stream, 400, "Bad Request", &format!("Invalid JSON: {e}")),
+        },
+
+        ("GET", "/api/buffer") => {
+            write_json(stream, 200, "OK", &buffer_json(shared));
+        }
+
+        ("PUT", "/api/buffer") => match serde_json::from_slice::<BufferPatch>(&req.body) {
+            Ok(patch) => {
+                if let Some(v) = patch.max_age_secs {
+                    shared.buffer_max_age_secs.store(v, Ordering::Relaxed);
+                }
+                if let Some(v) = patch.max_bytes {
+                    shared.buffer_max_bytes.store(v, Ordering::Relaxed);
+                }
+                eprintln!(
+                    "[api] buffer caps: {}s / {} bytes",
+                    shared.buffer_max_age_secs.load(Ordering::Relaxed),
+                    shared.buffer_max_bytes.load(Ordering::Relaxed),
+                );
+                write_json(stream, 200, "OK", &buffer_json(shared));
+            }
+            Err(e) => json_err(stream, 400, "Bad Request", &format!("Invalid JSON: {e}")),
+        },
+
+        // CORS preflight
+        ("OPTIONS", _) => {
+            let header = "HTTP/1.1 204 No Content\r\n\
+                          Access-Control-Allow-Origin: *\r\n\
+                          Access-Control-Allow-Methods: GET, PUT, OPTIONS\r\n\
+                          Access-Control-Allow-Headers: Content-Type\r\n\
+                          \r\n";
+            let _ = stream.write_all(header.as_bytes());
+        }
+
+        _ => json_err(stream, 404, "Not Found", "Unknown endpoint."),
+    }
+}
+
+/// Blocking HTTP server — one request per connection, connections handled
+/// sequentially. API calls are infrequent and cheap, so no per-client threads.
+fn run_http_server(
+    bind: &str,
+    shared: Arc<SharedState>,
+    config_tx: mpsc::Sender<prophesee_evk4::Configuration>,
+) {
+    let listener = TcpListener::bind(bind)
+        .unwrap_or_else(|e| panic!("Failed to bind HTTP API on {bind}: {e}"));
+    println!("[api] Listening on http://{bind}");
+
+    for stream in listener.incoming() {
+        let mut stream = match stream {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        // Clone the stream so the BufReader owns a read handle while `stream`
+        // stays writable for the response.
+        let mut reader = match stream.try_clone() {
+            Ok(s) => BufReader::new(s),
+            Err(_) => continue,
+        };
+        let req = match parse_request(&mut reader) {
+            Some(r) => r,
+            None => continue,
+        };
+        handle_api(&mut stream, &req, &shared, &config_tx);
+    }
+}
+
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), neuromorphic_drivers::Error> {
@@ -184,64 +623,85 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
     println!("[main] Triggers socket:  {}", args.triggers_socket.display());
     println!("[main] Output directory: {}", args.output_dir.display());
     println!("[main] File interval:    {}s", args.file_length);
+    println!(
+        "[main] Circular buffer:  {}s / {} bytes cap",
+        args.buffer_max_age, args.buffer_max_bytes
+    );
+    println!("[main] Recording:        OFF (toggle via the HTTP API)");
     println!("[main] Device starting — socket clients can connect at any time.");
 
     // ── Device setup ──────────────────────────────────────────────────────────
     let (flag, event_loop) = neuromorphic_drivers::flag_and_event_loop()?;
 
-    let mut evk_configuration = neuromorphic_drivers::prophesee_evk4::DEFAULT_CONFIGURATION;
-    evk_configuration.biases.diff_on = 102;
-    evk_configuration.biases.diff_off = 102;
+    let mut evk_configuration = prophesee_evk4::DEFAULT_CONFIGURATION;
+    evk_configuration.biases.diff_on = args.diff_on;
+    evk_configuration.biases.diff_off = args.diff_off;
+    println!(
+        "[main] Biases: diff_on={}, diff_off={}",
+        args.diff_on, args.diff_off
+    );
 
-    if args.rate_limit > 0 {
-        // Choose a 1 ms reference period (1000 µs) for smooth hardware limiting.
-        // maximum_events_per_period = rate_limit * (1000 / 1_000_000)
-        let reference_period_us: u16 = 1000;
-        let maximum_events_per_period = (args.rate_limit * reference_period_us as u64) / 1_000_000;
-        let maximum_events_per_period = maximum_events_per_period.max(1) as u32;
-        evk_configuration.rate_limiter = Some(
-            neuromorphic_drivers::prophesee_evk4::RateLimiter {
-                reference_period_us,
-                maximum_events_per_period,
-            },
-        );
-        println!("[main] Hardware rate limiter enabled: {} events/s ({} events per {} µs)",
-            args.rate_limit, maximum_events_per_period, reference_period_us);
-    } else {
-        println!("[main] Hardware rate limiter disabled.");
+    evk_configuration.rate_limiter = make_rate_limiter(args.rate_limit);
+    match &evk_configuration.rate_limiter {
+        Some(rl) => println!(
+            "[main] Hardware rate limiter enabled: {} events/s ({} events per {} µs)",
+            args.rate_limit, rl.maximum_events_per_period, rl.reference_period_us
+        ),
+        None => println!("[main] Hardware rate limiter disabled."),
     }
 
-    let device = neuromorphic_drivers::prophesee_evk4::open(
+    let device = prophesee_evk4::open(
         neuromorphic_drivers::SerialOrBusNumberAndAddress::None,
-        evk_configuration,
-        &neuromorphic_drivers::prophesee_evk4::DEFAULT_USB_CONFIGURATION,
+        evk_configuration.clone(),
+        &prophesee_evk4::DEFAULT_USB_CONFIGURATION,
         event_loop,
         flag.clone(),
     )?;
 
-    // Method of updating configuration
-    // let mut test_configuration = neuromorphic_drivers::prophesee_evk4::DEFAULT_CONFIGURATION;
-    // test_configuration.biases.diff_on = 73;
-    // test_configuration.biases.diff_on = 102;
-    // device.update_configuration(test_configuration);
-
     let mut adapter = device.create_adapter();
+
+    // ── Shared state ──────────────────────────────────────────────────────────
+    let shared = Arc::new(SharedState {
+        recording: AtomicBool::new(false),
+        buffer_max_age_secs: AtomicU64::new(args.buffer_max_age),
+        buffer_max_bytes: AtomicU64::new(args.buffer_max_bytes),
+        buffer_bytes: AtomicU64::new(0),
+        buffer_chunks: AtomicU64::new(0),
+        current_file: Mutex::new(None),
+        configuration: Mutex::new(evk_configuration),
+        rate_limit_eps: AtomicU64::new(args.rate_limit),
+    });
 
     let output_dir = args.output_dir.clone();
     let file_interval = Duration::from_secs(args.file_length);
 
-    // ── Channel ───────────────────────────────────────────────────────────────
+    // ── Channels ──────────────────────────────────────────────────────────────
     let (tx, rx) = mpsc::channel::<OwnedPacket>();
+    // API → ingester: full device configurations to apply at runtime.
+    let (config_tx, config_rx) = mpsc::channel::<prophesee_evk4::Configuration>();
+
+    // ── HTTP API thread ───────────────────────────────────────────────────────
+    {
+        let api_bind = args.api_bind.clone();
+        let shared = Arc::clone(&shared);
+        thread::spawn(move || run_http_server(&api_bind, shared, config_tx));
+    }
 
     // ── Processing thread ─────────────────────────────────────────────────────
+    let shared_processor = Arc::clone(&shared);
     let processor = thread::spawn(move || {
+        let shared = shared_processor;
+
         // Reusable buffers — cleared each packet, grown as needed, never reallocated
         // once they reach steady-state capacity.
         let mut events_buf: Vec<u8> = Vec::new();
         let mut triggers_buf: Vec<u8> = Vec::new();
 
-        let mut raw_file = open_raw_file(&output_dir);
+        // Recording is off until the API enables it — no file is open.
+        let mut raw_file: Option<std::fs::File> = None;
         let mut last_rollover = Instant::now();
+
+        let mut circular = CircularBuffer::new();
 
         let mut events_stream: Option<UnixStream> = None;
         let mut triggers_stream: Option<UnixStream> = None;
@@ -264,14 +724,46 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
                 triggers_stream = accept_next(&triggers_listener);
             }
 
-            // ── File rollover ─────────────────────────────────────────────────
-            if last_rollover.elapsed() >= file_interval {
-                raw_file = open_raw_file(&output_dir);
+            // ── Recording state transitions ───────────────────────────────────
+            let recording = shared.recording.load(Ordering::Relaxed);
+            if recording && raw_file.is_none() {
+                // Rising edge — open a file and write the circular buffer as
+                // pre-roll, so the recording includes the moments *before*
+                // the record command. The current packet is not in the buffer
+                // yet, so nothing is written twice.
+                let (path, mut file) = open_raw_file(&output_dir);
+                let mut preroll_bytes = 0usize;
+                for (_, data) in &circular.chunks {
+                    if let Err(e) = file.write_all(data) {
+                        eprintln!("[processor] Pre-roll write error: {e}");
+                        break;
+                    }
+                    preroll_bytes += data.len();
+                }
+                if preroll_bytes > 0 {
+                    println!(
+                        "[processor] Recording started — wrote {preroll_bytes} bytes of pre-roll."
+                    );
+                } else {
+                    println!("[processor] Recording started (buffer empty — no pre-roll).");
+                }
+                *shared.current_file.lock().unwrap() = Some(path);
+                raw_file = Some(file);
                 last_rollover = Instant::now();
+            } else if !recording && raw_file.is_some() {
+                // Falling edge — close the file.
+                raw_file = None;
+                *shared.current_file.lock().unwrap() = None;
+                println!("[processor] Recording stopped — file closed.");
             }
 
-            #[cfg(debug_assertions)]
-            { packet_count += 1; }
+            // ── File rollover (only while recording) ──────────────────────────
+            if raw_file.is_some() && last_rollover.elapsed() >= file_interval {
+                let (path, file) = open_raw_file(&output_dir);
+                *shared.current_file.lock().unwrap() = Some(path);
+                raw_file = Some(file);
+                last_rollover = Instant::now();
+            }
 
             let mut dvs_count = 0u64;
             let mut trigger_count = 0u64;
@@ -313,10 +805,12 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
             );
             let decode_us = t_decode.elapsed().as_micros() as u64;
 
-            // ── Write raw bytes to file ───────────────────────────────────────
+            // ── Write raw bytes to file (recording only) ──────────────────────
             let t_file = Instant::now();
-            if let Err(e) = raw_file.write_all(&packet.raw_bytes) {
-                eprintln!("[processor] Raw file write error: {e}");
+            if let Some(file) = raw_file.as_mut() {
+                if let Err(e) = file.write_all(&packet.raw_bytes) {
+                    eprintln!("[processor] Raw file write error: {e}");
+                }
             }
             let file_write_us = t_file.elapsed().as_micros() as u64;
 
@@ -338,6 +832,20 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
             total_decode_us += decode_us;
             total_file_write_us += file_write_us;
             total_socket_send_us += socket_send_us;
+
+            // ── Circular buffer ───────────────────────────────────────────────
+            // Last use of the packet — move its bytes into the buffer (no copy).
+            circular.push(packet.raw_bytes);
+            circular.evict(
+                Duration::from_secs(shared.buffer_max_age_secs.load(Ordering::Relaxed)),
+                shared.buffer_max_bytes.load(Ordering::Relaxed) as usize,
+            );
+            shared
+                .buffer_bytes
+                .store(circular.total_bytes as u64, Ordering::Relaxed);
+            shared
+                .buffer_chunks
+                .store(circular.chunks.len() as u64, Ordering::Relaxed);
 
             if last_metrics.elapsed() >= Duration::from_secs(1) {
                 let secs = last_metrics.elapsed().as_secs_f64();
@@ -369,6 +877,13 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
     // ── Ingestion thread ──────────────────────────────────────────────────────
     let ingester = thread::spawn(move || {
         loop {
+            // Apply pending device configuration updates from the HTTP API.
+            // Runs before each read, so updates land within one timeout period.
+            while let Ok(configuration) = config_rx.try_recv() {
+                device.update_configuration(configuration);
+                println!("[ingester] Applied configuration update from API.");
+            }
+
             let buffer_view = device.next_with_timeout(&std::time::Duration::from_millis(100));
             if let Some(buffer_view) = buffer_view {
 
