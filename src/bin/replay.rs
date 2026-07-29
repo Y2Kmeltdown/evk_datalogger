@@ -13,13 +13,30 @@
 //!     cargo run --bin replay -- <path/to/recording.bin> --speed 2.0   # double speed
 
 use std::io::{Read, Write};
-use std::os::unix::net::UnixListener;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use uds_windows::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
+
+/// Base directory for the default socket path.
+/// `/tmp` on Unix; the per-user temp directory on Windows.
+#[cfg(unix)]
+fn default_tmp_dir() -> PathBuf {
+    PathBuf::from("/tmp")
+}
+
+/// Base directory for the default socket path.
+/// `/tmp` on Unix; the per-user temp directory on Windows.
+#[cfg(windows)]
+fn default_tmp_dir() -> PathBuf {
+    std::env::temp_dir()
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "replay", about = "Replay a raw EVK4 recording over Unix sockets")]
@@ -28,7 +45,7 @@ struct Args {
     recording: PathBuf,
 
     /// Unix socket path for decoded DVS events
-    #[arg(long, default_value = "/tmp/evk4_events.sock")]
+    #[arg(long, default_value_os_t = default_tmp_dir().join("evk4_events.sock"))]
     events_socket: PathBuf,
 
     /// Unix socket path for decoded trigger events (omit to disable trigger publishing)
@@ -74,7 +91,7 @@ fn trigger_to_bytes(
 
 /// Write a length-prefixed binary payload to a stream.
 /// Returns false if the client has disconnected.
-fn try_send(stream: &mut std::os::unix::net::UnixStream, data: &[u8]) -> bool {
+fn try_send(stream: &mut UnixStream, data: &[u8]) -> bool {
     let len = data.len() as u32;
     stream.write_all(&len.to_le_bytes()).is_ok() && stream.write_all(data).is_ok()
 }
