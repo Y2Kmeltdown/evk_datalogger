@@ -1,7 +1,9 @@
 //! EVK4 ingestion pipeline with HTTP API control.
 //!
 //! Streams decoded DVS / trigger events to Unix sockets and records raw data
-//! on demand. Recording is OFF by default and is toggled via the HTTP API.
+//! to timestamped files. Recording is ALWAYS ON by default and cannot be
+//! disabled; passing --record-toggle instead starts the pipeline with
+//! recording off and enables start/stop control via the HTTP API.
 //! A circular buffer keeps recent raw history in memory, so a recording that
 //! starts later still contains the moments *before* the record command
 //! (pre-roll). The buffer is bounded by two caps applied together: chunks
@@ -12,8 +14,8 @@
 //! HTTP API (default bind: 0.0.0.0:8081)
 //! ─────────────────────────────────────
 //!   GET  /api/status       Full state: recording, file, biases, rate limit, buffer
-//!   GET  /api/recording    {"recording": bool, "current_file": path|null}
-//!   PUT  /api/recording    body: {"recording": true|false}
+//!   GET  /api/recording    {"recording": bool, "recording_control": bool, "current_file": path|null}
+//!   PUT  /api/recording    body: {"recording": true|false}  (only with --record-toggle)
 //!   GET  /api/biases       Current camera biases (full driver struct)
 //!   PUT  /api/biases       body: any subset of {"diff","diff_on","diff_off",
 //!                          "hpf","refr","pr","fo","inv"} — applied at runtime
@@ -92,6 +94,11 @@ struct Args {
     /// Initial camera bias: diff_off (OFF-event contrast threshold)
     #[arg(long, default_value_t = 102)]
     diff_off: u8,
+
+    /// Start with recording OFF and allow it to be toggled via the HTTP API.
+    /// Without this flag, recording is always on and cannot be disabled.
+    #[arg(long, default_value_t = false)]
+    record_toggle: bool,
 
     /// HTTP API bind address
     #[arg(long, default_value = "0.0.0.0:8081")]
@@ -254,8 +261,12 @@ fn make_rate_limiter(events_per_second: u64) -> Option<prophesee_evk4::RateLimit
 /// and forwards clones to the ingester thread, which owns the device and is
 /// therefore the only place `update_configuration` is called.
 struct SharedState {
-    /// Recording on/off — set by the API, consumed by the processor thread.
+    /// Recording on/off — set by the API (only when `recording_toggle` is
+    /// enabled), consumed by the processor thread.
     recording: AtomicBool,
+    /// When false, recording is always on and PUT /api/recording is rejected.
+    /// Set once at startup from --record-toggle; read-only afterwards.
+    recording_toggle: bool,
     /// Circular buffer caps — set by the API.
     buffer_max_age_secs: AtomicU64,
     buffer_max_bytes: AtomicU64,
@@ -448,9 +459,10 @@ fn handle_api(
                 serde_json::to_string(&cfg.biases).unwrap()
             };
             let body = format!(
-                "{{\"recording\":{},\"current_file\":{},\"rate_limit_events_per_second\":{},\
-                 \"biases\":{},\"buffer\":{}}}",
+                "{{\"recording\":{},\"recording_control\":{},\"current_file\":{},\
+                 \"rate_limit_events_per_second\":{},\"biases\":{},\"buffer\":{}}}",
                 shared.recording.load(Ordering::Relaxed),
+                shared.recording_toggle,
                 current_file_json(shared),
                 shared.rate_limit_eps.load(Ordering::Relaxed),
                 biases,
@@ -461,25 +473,37 @@ fn handle_api(
 
         ("GET", "/api/recording") => {
             let body = format!(
-                "{{\"recording\":{},\"current_file\":{}}}",
+                "{{\"recording\":{},\"recording_control\":{},\"current_file\":{}}}",
                 shared.recording.load(Ordering::Relaxed),
+                shared.recording_toggle,
                 current_file_json(shared),
             );
             write_json(stream, 200, "OK", &body);
         }
 
-        ("PUT", "/api/recording") => match serde_json::from_slice::<RecordingPatch>(&req.body) {
-            Ok(patch) => {
-                shared.recording.store(patch.recording, Ordering::Relaxed);
-                eprintln!(
-                    "[api] recording {}",
-                    if patch.recording { "enabled" } else { "disabled" }
+        ("PUT", "/api/recording") => {
+            if !shared.recording_toggle {
+                json_err(
+                    stream,
+                    403,
+                    "Forbidden",
+                    "Recording control is disabled — restart with --record-toggle to enable it.",
                 );
-                let body = format!("{{\"recording\":{}}}", patch.recording);
-                write_json(stream, 200, "OK", &body);
+                return;
             }
-            Err(e) => json_err(stream, 400, "Bad Request", &format!("Invalid JSON: {e}")),
-        },
+            match serde_json::from_slice::<RecordingPatch>(&req.body) {
+                Ok(patch) => {
+                    shared.recording.store(patch.recording, Ordering::Relaxed);
+                    eprintln!(
+                        "[api] recording {}",
+                        if patch.recording { "enabled" } else { "disabled" }
+                    );
+                    let body = format!("{{\"recording\":{}}}", patch.recording);
+                    write_json(stream, 200, "OK", &body);
+                }
+                Err(e) => json_err(stream, 400, "Bad Request", &format!("Invalid JSON: {e}")),
+            }
+        }
 
         ("GET", "/api/biases") => {
             let cfg = shared.configuration.lock().unwrap();
@@ -628,7 +652,11 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
         "[main] Circular buffer:  {}s / {} bytes cap",
         args.buffer_max_age, args.buffer_max_bytes
     );
-    println!("[main] Recording:        OFF (toggle via the HTTP API)");
+    if args.record_toggle {
+        println!("[main] Recording:        OFF (toggle via the HTTP API)");
+    } else {
+        println!("[main] Recording:        ALWAYS ON (no API control — see --record-toggle)");
+    }
     println!("[main] Device starting — socket clients can connect at any time.");
 
     // ── Device setup ──────────────────────────────────────────────────────────
@@ -663,7 +691,10 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
 
     // ── Shared state ──────────────────────────────────────────────────────────
     let shared = Arc::new(SharedState {
-        recording: AtomicBool::new(false),
+        // Always-on unless --record-toggle was passed — then it starts off
+        // and the HTTP API controls it.
+        recording: AtomicBool::new(!args.record_toggle),
+        recording_toggle: args.record_toggle,
         buffer_max_age_secs: AtomicU64::new(args.buffer_max_age),
         buffer_max_bytes: AtomicU64::new(args.buffer_max_bytes),
         buffer_bytes: AtomicU64::new(0),

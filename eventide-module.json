@@ -1,7 +1,7 @@
 {
   "name": "evk-datalogger",
-  "version": "1.0.0",
-  "description": "EVK4 event camera datalogger with an MJPEG live-stream server (viewfinder).",
+  "version": "1.1.0",
+  "description": "EVK4 event camera datalogger with HTTP API control (runtime biases, rate limiter, circular buffer) and an MJPEG live-stream server (viewfinder).",
   "author": "Y2Kmeltdown",
   "dependencies": {
     "apt": ["build-essential", "pkg-config", "libusb-1.0-0-dev"],
@@ -49,7 +49,47 @@
       "type": "int",
       "default": 0,
       "required": false,
-      "description": "Hardware event-rate limit (events/second). 0 = unlimited."
+      "description": "Initial hardware event-rate limit (events/second). 0 = unlimited. Adjustable at runtime via the HTTP API."
+    },
+    {
+      "name": "diff_on",
+      "flag": "--diff-on",
+      "type": "int",
+      "default": 102,
+      "required": false,
+      "description": "Initial diff_on camera bias (ON-event contrast threshold, 0-255). Adjustable at runtime via the HTTP API."
+    },
+    {
+      "name": "diff_off",
+      "flag": "--diff-off",
+      "type": "int",
+      "default": 102,
+      "required": false,
+      "description": "Initial diff_off camera bias (OFF-event contrast threshold, 0-255). Adjustable at runtime via the HTTP API."
+    },
+    {
+      "name": "api_port",
+      "flag": "--api-bind",
+      "type": "int",
+      "default": 8084,
+      "required": false,
+      "description": "TCP port for the datalogger HTTP API (recording status, runtime biases, rate limiter, circular buffer). Bound as 0.0.0.0:<port>."
+    },
+    {
+      "name": "buffer_max_age",
+      "flag": "--buffer-max-age",
+      "type": "int",
+      "default": 10,
+      "required": false,
+      "description": "Circular buffer cap: maximum seconds of raw history retained (0 = buffer off). Adjustable at runtime via the HTTP API."
+    },
+    {
+      "name": "buffer_max_bytes",
+      "flag": "--buffer-max-bytes",
+      "type": "int",
+      "default": 104857600,
+      "required": false,
+      "description": "Circular buffer cap: maximum bytes of raw history retained (0 = buffer off). Adjustable at runtime via the HTTP API."
     },
     {
       "name": "stream_port",
@@ -86,12 +126,18 @@
       "type": "tcp",
       "port": 8081,
       "description": "Viewfinder MJPEG stream plus /api/settings and /api/streaming (proxied by nginx at /stream/evk/ and /settings/evk/)."
+    },
+    {
+      "name": "http_api",
+      "type": "tcp",
+      "port": 8084,
+      "description": "Datalogger HTTP API: recording status, runtime camera biases, rate limiter, and circular buffer caps. Recording itself is always on (built without --record-toggle)."
     }
   ],
   "programs": [
     {
       "name": "event_based_camera",
-      "command": "{install_dir}/evk_datalogger --output-dir {recordings_dir}/evk/ --events-socket {arg:events_socket} --triggers-socket {arg:triggers_socket} --file-length {arg:file_length} --rate-limit {arg:rate_limit}",
+      "command": "{install_dir}/evk_datalogger --output-dir {recordings_dir}/evk/ --events-socket {arg:events_socket} --triggers-socket {arg:triggers_socket} --file-length {arg:file_length} --rate-limit {arg:rate_limit} --diff-on {arg:diff_on} --diff-off {arg:diff_off} --api-bind 0.0.0.0:{arg:api_port} --buffer-max-age {arg:buffer_max_age} --buffer-max-bytes {arg:buffer_max_bytes}",
       "directory": "{install_dir}",
       "autostart": true,
       "autorestart": true,
