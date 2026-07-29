@@ -5,7 +5,7 @@
 # dependencies.commands (USB access to the event camera); the Rust binaries
 # themselves link the neuromorphic-drivers crate, not this package.
 neuromorphic_drivers==0.17.0
-faery==0.7.0
+# faery==0.7.0
 
 # evk_dashboard.py — web GUI for the datalogger + viewfinder HTTP APIs
 flask==3.1.3
