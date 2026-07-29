@@ -28,7 +28,10 @@
 
 use std::io::{BufRead, BufReader, Cursor, Read, Write};
 use std::net::TcpListener;
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
+#[cfg(windows)]
+use uds_windows::UnixStream;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -39,6 +42,23 @@ use image::imageops::FilterType;
 use serde::{Deserialize, Serialize};
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
+
+/// Default events socket path.
+/// Under `/tmp` on Unix; in the per-user temp directory on Windows.
+#[cfg(unix)]
+fn default_events_socket() -> String {
+    String::from("/tmp/evk4_events.sock")
+}
+
+/// Default events socket path.
+/// Under `/tmp` on Unix; in the per-user temp directory on Windows.
+#[cfg(windows)]
+fn default_events_socket() -> String {
+    std::env::temp_dir()
+        .join("evk4_events.sock")
+        .to_string_lossy()
+        .into_owned()
+}
 
 #[derive(Parser, Debug, Clone)]
 #[command(name = "evk4-mjpeg", about = "EVK4 MJPEG stream server")]
@@ -64,7 +84,7 @@ struct Args {
     bind: String,
 
     /// Unix socket path for the decoded DVS events
-    #[arg(long, default_value = "/tmp/evk4_events.sock")]
+    #[arg(long, default_value_t = default_events_socket())]
     events_socket: String,
 }
 

@@ -1,5 +1,8 @@
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(windows)]
+use uds_windows::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -11,6 +14,20 @@ use clap::Parser;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
+/// Base directory for default socket paths and recordings.
+/// `/tmp` on Unix; the per-user temp directory on Windows.
+#[cfg(unix)]
+fn default_tmp_dir() -> PathBuf {
+    PathBuf::from("/tmp")
+}
+
+/// Base directory for default socket paths and recordings.
+/// `/tmp` on Unix; the per-user temp directory on Windows.
+#[cfg(windows)]
+fn default_tmp_dir() -> PathBuf {
+    std::env::temp_dir()
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "evk4-pipeline",
@@ -18,15 +35,15 @@ use clap::Parser;
 )]
 struct Args {
     /// Unix socket path for decoded DVS events
-    #[arg(long, default_value = "/tmp/evk4_events.sock")]
+    #[arg(long, default_value_os_t = default_tmp_dir().join("evk4_events.sock"))]
     events_socket: PathBuf,
 
     /// Unix socket path for decoded trigger events
-    #[arg(long, default_value = "/tmp/evk4_triggers.sock")]
+    #[arg(long, default_value_os_t = default_tmp_dir().join("evk4_triggers.sock"))]
     triggers_socket: PathBuf,
 
     /// Directory to write raw recording files into
-    #[arg(long, default_value = "/tmp/evk4_raw")]
+    #[arg(long, default_value_os_t = default_tmp_dir().join("evk4_raw"))]
     output_dir: PathBuf,
 
     /// How often (in seconds) to roll over to a new raw output file
@@ -36,6 +53,14 @@ struct Args {
     /// Hardware event-rate limit (events per second). 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     rate_limit: u64,
+
+    /// Camera bias: diff_on (ON-event contrast threshold)
+    #[arg(long, default_value_t = 102)]
+    diff_on: u8,
+
+    /// Camera bias: diff_off (OFF-event contrast threshold)
+    #[arg(long, default_value_t = 102)]
+    diff_off: u8,
 }
 
 // ── Binary event structs ──────────────────────────────────────────────────────
@@ -190,8 +215,12 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
     let (flag, event_loop) = neuromorphic_drivers::flag_and_event_loop()?;
 
     let mut evk_configuration = neuromorphic_drivers::prophesee_evk4::DEFAULT_CONFIGURATION;
-    evk_configuration.biases.diff_on = 102;
-    evk_configuration.biases.diff_off = 102;
+    evk_configuration.biases.diff_on = args.diff_on;
+    evk_configuration.biases.diff_off = args.diff_off;
+    println!(
+        "[main] Biases: diff_on={}, diff_off={}",
+        args.diff_on, args.diff_off
+    );
 
     if args.rate_limit > 0 {
         // Choose a 1 ms reference period (1000 µs) for smooth hardware limiting.
@@ -269,9 +298,6 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
                 raw_file = open_raw_file(&output_dir);
                 last_rollover = Instant::now();
             }
-
-            #[cfg(debug_assertions)]
-            { packet_count += 1; }
 
             let mut dvs_count = 0u64;
             let mut trigger_count = 0u64;
