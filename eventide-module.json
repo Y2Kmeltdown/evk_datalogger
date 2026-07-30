@@ -100,6 +100,76 @@
       "description": "Datalogger HTTP API: recording status, runtime camera biases, rate limiter, and circular buffer caps. Port allocated by eventide at install time. Recording itself is always on (built without --record-toggle)."
     }
   ],
+  "ui": [
+    {
+      "id": "live",
+      "type": "mjpeg",
+      "title": "EVK4 LIVE",
+      "region": "center",
+      "default": true,
+      "socket": "mjpeg",
+      "path": "/stream"
+    },
+    {
+      "id": "stream-settings",
+      "type": "form",
+      "title": "EVK4 STREAM",
+      "region": "sidebar",
+      "default": true,
+      "socket": "mjpeg",
+      "get": "/api/settings",
+      "put": "/api/settings",
+      "fields": [
+        {"key": "quality", "label": "Quality", "kind": "slider", "min": 1, "max": 100},
+        {"key": "out_width", "label": "Width", "kind": "number", "min": 1},
+        {"key": "out_height", "label": "Height", "kind": "number", "min": 1},
+        {"key": "streaming", "label": "Stream enabled", "kind": "toggle", "get": "/api/streaming", "put": "/api/streaming"}
+      ]
+    },
+    {
+      "id": "biases",
+      "type": "form",
+      "title": "EVK4 BIASES",
+      "region": "sidebar",
+      "default": true,
+      "socket": "http_api",
+      "get": "/api/biases",
+      "put": "/api/biases",
+      "fields": [
+        {"key": "diff_on", "label": "diff_on (0-255)", "kind": "number", "min": 0, "max": 255},
+        {"key": "diff_off", "label": "diff_off (0-255)", "kind": "number", "min": 0, "max": 255}
+      ]
+    },
+    {
+      "id": "recording",
+      "type": "form",
+      "title": "EVK4 RECORDING",
+      "region": "sidebar",
+      "default": true,
+      "socket": "http_api",
+      "fields": [
+        {"key": "events_per_second", "label": "Rate limit (ev/s, 0 = unlimited)", "kind": "number", "min": 0, "get": "/api/rate-limit", "put": "/api/rate-limit"},
+        {"key": "max_age_secs", "label": "Buffer max age (s)", "kind": "number", "min": 0, "get": "/api/buffer", "put": "/api/buffer"},
+        {"key": "max_bytes", "label": "Buffer max bytes", "kind": "number", "min": 0, "get": "/api/buffer", "put": "/api/buffer"}
+      ]
+    },
+    {
+      "id": "rec-status",
+      "type": "telemetry",
+      "title": "EVK4 RECORDER STATUS",
+      "region": "sidebar",
+      "default": false,
+      "socket": "http_api",
+      "get": "/api/status",
+      "interval": 3000,
+      "rows": [
+        {"label": "RECORDING", "path": "recording"},
+        {"label": "FILE", "path": "current_file"},
+        {"label": "BUFFER BYTES", "path": "buffer.bytes"},
+        {"label": "BUFFER CHUNKS", "path": "buffer.chunks"}
+      ]
+    }
+  ],
   "programs": [
     {
       "name": "event_based_camera",
