@@ -97,8 +97,8 @@ struct Args {
 
     /// Start with recording OFF and allow it to be toggled via the HTTP API.
     /// Without this flag, recording is always on and cannot be disabled.
-    #[arg(long, default_value_t = false)]
-    record_toggle: bool,
+    #[arg(long, default_value = "false")]
+    record_toggle: String,
 
     /// HTTP API bind address
     #[arg(long, default_value = "0.0.0.0:8081")]
@@ -652,7 +652,9 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
         "[main] Circular buffer:  {}s / {} bytes cap",
         args.buffer_max_age, args.buffer_max_bytes
     );
-    if args.record_toggle {
+    let record_toggle = args.record_toggle.to_lowercase() == "true";
+
+    if record_toggle {
         println!("[main] Recording:        OFF (toggle via the HTTP API)");
     } else {
         println!("[main] Recording:        ALWAYS ON (no API control — see --record-toggle)");
@@ -693,8 +695,8 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
     let shared = Arc::new(SharedState {
         // Always-on unless --record-toggle was passed — then it starts off
         // and the HTTP API controls it.
-        recording: AtomicBool::new(!args.record_toggle),
-        recording_toggle: args.record_toggle,
+        recording: AtomicBool::new(!record_toggle),
+        recording_toggle: record_toggle,
         buffer_max_age_secs: AtomicU64::new(args.buffer_max_age),
         buffer_max_bytes: AtomicU64::new(args.buffer_max_bytes),
         buffer_bytes: AtomicU64::new(0),

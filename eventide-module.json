@@ -74,6 +74,14 @@
       "default": 15,
       "required": false,
       "description": "JPEG quality for the live stream (1-100)."
+    },
+    {
+      "name": "record_toggle",
+      "flag": "--record-toggle",
+      "type": "str",
+      "default": "false",
+      "required": false,
+      "description": "Set recording to be off by default and changeable (true) or on by default and locked (false)"
     }
   ],
   "sockets": [
@@ -173,7 +181,7 @@
   "programs": [
     {
       "name": "event_based_camera",
-      "command": "{install_dir}/evk_datalogger --output-dir {recordings_subdir} --events-socket {socket:events} --triggers-socket {socket:triggers} --file-length {arg:file_length} --rate-limit {arg:rate_limit} --diff-on {arg:diff_on} --diff-off {arg:diff_off} --api-bind 0.0.0.0:{socket:http_api} --buffer-max-age {arg:buffer_max_age} --buffer-max-bytes {arg:buffer_max_bytes}",
+      "command": "{install_dir}/evk_datalogger --output-dir {recordings_subdir} --events-socket {socket:events} --triggers-socket {socket:triggers} --file-length {arg:file_length} --rate-limit {arg:rate_limit} --diff-on {arg:diff_on} --diff-off {arg:diff_off} --api-bind 0.0.0.0:{socket:http_api} --buffer-max-age {arg:buffer_max_age} --buffer-max-bytes {arg:buffer_max_bytes} --record-toggle {arg:record_toggle}",
       "directory": "{install_dir}",
       "autostart": true,
       "autorestart": true,
