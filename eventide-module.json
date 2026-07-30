@@ -20,22 +20,6 @@
   "recordings_subdir": "evk",
   "arguments": [
     {
-      "name": "events_socket",
-      "flag": "--events-socket",
-      "type": "str",
-      "default": "/tmp/evk4_events.sock",
-      "required": false,
-      "description": "Unix socket the datalogger publishes decoded DVS events to."
-    },
-    {
-      "name": "triggers_socket",
-      "flag": "--triggers-socket",
-      "type": "str",
-      "default": "/tmp/evk4_triggers.sock",
-      "required": false,
-      "description": "Unix socket the datalogger publishes trigger events to."
-    },
-    {
       "name": "file_length",
       "flag": "--file-length",
       "type": "int",
@@ -68,14 +52,6 @@
       "description": "Initial diff_off camera bias (OFF-event contrast threshold, 0-255). Adjustable at runtime via the HTTP API."
     },
     {
-      "name": "api_port",
-      "flag": "--api-bind",
-      "type": "int",
-      "default": 8084,
-      "required": false,
-      "description": "TCP port for the datalogger HTTP API (recording status, runtime biases, rate limiter, circular buffer). Bound as 0.0.0.0:<port>."
-    },
-    {
       "name": "buffer_max_age",
       "flag": "--buffer-max-age",
       "type": "int",
@@ -90,14 +66,6 @@
       "default": 104857600,
       "required": false,
       "description": "Circular buffer cap: maximum bytes of raw history retained (0 = buffer off). Adjustable at runtime via the HTTP API."
-    },
-    {
-      "name": "stream_port",
-      "flag": "--bind",
-      "type": "int",
-      "default": 8081,
-      "required": true,
-      "description": "Port the viewfinder MJPEG server binds (nginx proxies /stream/evk/ here)."
     },
     {
       "name": "stream_quality",
@@ -122,22 +90,20 @@
       "description": "Trigger events published by event_based_camera (see trigger_test.py)."
     },
     {
-      "name": "mjpeg_stream",
+      "name": "mjpeg",
       "type": "tcp",
-      "port": 8081,
-      "description": "Viewfinder MJPEG stream plus /api/settings and /api/streaming (proxied by nginx at /stream/evk/ and /settings/evk/)."
+      "description": "Viewfinder MJPEG stream plus /api/settings and /api/streaming. Port allocated by eventide at install time; reachable at /proxy/evk-datalogger/mjpeg/."
     },
     {
       "name": "http_api",
       "type": "tcp",
-      "port": 8084,
-      "description": "Datalogger HTTP API: recording status, runtime camera biases, rate limiter, and circular buffer caps. Recording itself is always on (built without --record-toggle)."
+      "description": "Datalogger HTTP API: recording status, runtime camera biases, rate limiter, and circular buffer caps. Port allocated by eventide at install time. Recording itself is always on (built without --record-toggle)."
     }
   ],
   "programs": [
     {
       "name": "event_based_camera",
-      "command": "{install_dir}/evk_datalogger --output-dir {recordings_dir}/evk/ --events-socket {arg:events_socket} --triggers-socket {arg:triggers_socket} --file-length {arg:file_length} --rate-limit {arg:rate_limit} --diff-on {arg:diff_on} --diff-off {arg:diff_off} --api-bind 0.0.0.0:{arg:api_port} --buffer-max-age {arg:buffer_max_age} --buffer-max-bytes {arg:buffer_max_bytes}",
+      "command": "{install_dir}/evk_datalogger --output-dir {recordings_subdir} --events-socket {socket:events} --triggers-socket {socket:triggers} --file-length {arg:file_length} --rate-limit {arg:rate_limit} --diff-on {arg:diff_on} --diff-off {arg:diff_off} --api-bind 0.0.0.0:{socket:http_api} --buffer-max-age {arg:buffer_max_age} --buffer-max-bytes {arg:buffer_max_bytes}",
       "directory": "{install_dir}",
       "autostart": true,
       "autorestart": true,
@@ -147,7 +113,7 @@
     },
     {
       "name": "evk_mjpeg_server",
-      "command": "{install_dir}/viewfinder --bind 0.0.0.0:{arg:stream_port} --events-socket {arg:events_socket} --quality {arg:stream_quality}",
+      "command": "{install_dir}/viewfinder --bind 0.0.0.0:{socket:mjpeg} --events-socket {socket:events} --quality {arg:stream_quality}",
       "directory": "{install_dir}",
       "autostart": true,
       "autorestart": true,
