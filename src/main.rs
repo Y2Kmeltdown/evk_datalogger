@@ -11,6 +11,11 @@
 //! while the total size exceeds `max_bytes`. Setting either cap to 0
 //! effectively disables the buffer.
 //!
+//! A USB watchdog (--watchdog-secs, default 10) detects a silently wedged
+//! endpoint — total data silence, the failure mode of the RK3588 6.1 xHCI
+//! bug — by dropping the device, running usb_reset.sh / usb_replug.sh when
+//! found next to the binary, and re-opening. 0 disables it.
+//!
 //! HTTP API (default bind: 0.0.0.0:8081)
 //! ─────────────────────────────────────
 //!   GET  /api/status       Full state: recording, file, biases, rate limit, buffer
@@ -111,6 +116,13 @@ struct Args {
     /// Circular buffer cap: maximum total size in bytes. 0 = buffer off.
     #[arg(long, default_value_t = 100 * 1024 * 1024)]
     buffer_max_bytes: u64,
+
+    /// USB watchdog: if no data arrives for this many seconds, drop the
+    /// device, run usb_reset.sh / usb_replug.sh (looked up next to the
+    /// binary), then re-open and resume. Retries until the camera returns.
+    /// 0 = disabled.
+    #[arg(long, default_value_t = 10)]
+    watchdog_secs: u64,
 }
 
 // ── Binary event structs ──────────────────────────────────────────────────────
@@ -250,6 +262,30 @@ fn make_rate_limiter(events_per_second: u64) -> Option<prophesee_evk4::RateLimit
         reference_period_us,
         maximum_events_per_period,
     })
+}
+
+/// Run the software USB re-plug scripts, if present next to the binary.
+///
+/// Used by the watchdog before re-opening the device: a wedged endpoint is
+/// usually revived by USBDEVFS_RESET (usb_reset.sh, no root needed) or the
+/// sysfs `authorized` toggle (usb_replug.sh, self-elevates via sudo when
+/// possible). Missing or failing scripts are logged and ignored.
+fn run_recovery_scripts() {
+    let dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    let Some(dir) = dir else { return };
+    for script in ["usb_reset.sh", "usb_replug.sh"] {
+        let path = dir.join(script);
+        if !path.is_file() {
+            continue;
+        }
+        eprintln!("[watchdog] Running {}", path.display());
+        match std::process::Command::new("bash").arg(&path).status() {
+            Ok(status) => eprintln!("[watchdog] {} exited with {status}", path.display()),
+            Err(e) => eprintln!("[watchdog] Failed to run {}: {e}", path.display()),
+        }
+    }
 }
 
 // ── Shared control state ──────────────────────────────────────────────────────
@@ -652,6 +688,11 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
         "[main] Circular buffer:  {}s / {} bytes cap",
         args.buffer_max_age, args.buffer_max_bytes
     );
+    if args.watchdog_secs > 0 {
+        println!("[main] Watchdog:           {}s silence triggers USB recovery", args.watchdog_secs);
+    } else {
+        println!("[main] Watchdog:           disabled");
+    }
     let record_toggle = args.record_toggle.to_lowercase() == "true";
 
     if record_toggle {
@@ -913,58 +954,112 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
     });
 
     // ── Ingestion thread ──────────────────────────────────────────────────────
+    let shared_ingester = Arc::clone(&shared);
+    let watchdog_secs = args.watchdog_secs;
     let ingester = thread::spawn(move || {
         let mut dropped_packets: u64 = 0;
+        let mut device = Some(device);
+        let mut flag = flag;
+        let mut last_packet = Instant::now();
+
         loop {
-            // Apply pending device configuration updates from the HTTP API.
-            // Runs before each read, so updates land within one timeout period.
-            while let Ok(configuration) = config_rx.try_recv() {
-                device.update_configuration(configuration);
-                println!("[ingester] Applied configuration update from API.");
-            }
+            if let Some(d) = device.as_mut() {
+                // Apply pending device configuration updates from the HTTP API.
+                // Runs before each read, so updates land within one timeout period.
+                while let Ok(configuration) = config_rx.try_recv() {
+                    d.update_configuration(configuration);
+                    println!("[ingester] Applied configuration update from API.");
+                }
 
-            let buffer_view = device.next_with_timeout(&std::time::Duration::from_millis(100));
-            if let Some(buffer_view) = buffer_view {
+                let buffer_view = d.next_with_timeout(&std::time::Duration::from_millis(100));
+                if let Some(buffer_view) = buffer_view {
+                    last_packet = Instant::now();
 
-                let now_us = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_micros() as u64;
-                let delay_us = buffer_view.delay().as_micros() as u64;
-                let system_timestamp_us = now_us.saturating_sub(delay_us);
+                    let now_us = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_micros() as u64;
+                    let delay_us = buffer_view.delay().as_micros() as u64;
+                    let system_timestamp_us = now_us.saturating_sub(delay_us);
 
-                let mut index_data = [0u8; 16];
-                index_data[0..8].copy_from_slice(&now_us.to_le_bytes());
-                index_data[8..16].copy_from_slice(&system_timestamp_us.to_le_bytes());
+                    let mut index_data = [0u8; 16];
+                    index_data[0..8].copy_from_slice(&now_us.to_le_bytes());
+                    index_data[8..16].copy_from_slice(&system_timestamp_us.to_le_bytes());
 
-                let packet = OwnedPacket {
-                    raw_bytes: buffer_view.slice.to_vec(),
-                    index_data,
-                };
+                    let packet = OwnedPacket {
+                        raw_bytes: buffer_view.slice.to_vec(),
+                        index_data,
+                    };
 
-                match tx.try_send(packet) {
-                    Ok(()) => {}
-                    Err(mpsc::TrySendError::Full(_)) => {
-                        // Processor is backlogged — drop rather than grow the
-                        // queue without bound (which ends in an OOM kill).
-                        dropped_packets += 1;
-                        if dropped_packets % 1024 == 1 {
-                            eprintln!(
-                                "[ingester] Processor backlogged — dropped {dropped_packets} packets so far."
-                            );
+                    match tx.try_send(packet) {
+                        Ok(()) => {}
+                        Err(mpsc::TrySendError::Full(_)) => {
+                            // Processor is backlogged — drop rather than grow the
+                            // queue without bound (which ends in an OOM kill).
+                            dropped_packets += 1;
+                            if dropped_packets % 1024 == 1 {
+                                eprintln!(
+                                    "[ingester] Processor backlogged — dropped {dropped_packets} packets so far."
+                                );
+                            }
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => {
+                            eprintln!("[ingester] Receiver gone — stopping ingestion.");
+                            break;
                         }
                     }
-                    Err(mpsc::TrySendError::Disconnected(_)) => {
-                        eprintln!("[ingester] Receiver gone — stopping ingestion.");
-                        break;
-                    }
+                }
+
+                let _ = flag.load_error();
+
+                if flag.load_warning().is_some() {
+                    println!("[ingester] USB circular buffer overflow");
                 }
             }
 
-            let _ = flag.load_error();
-
-            if flag.load_warning().is_some() {
-                println!("[ingester] USB circular buffer overflow");
+            // ── USB watchdog ────────────────────────────────────────────────
+            // A wedged endpoint produces total silence, not an error: the
+            // infinite-timeout bulk transfers simply never complete. If
+            // nothing has arrived for --watchdog-secs, drop the device, run
+            // the software re-plug scripts, and re-open. Keeps retrying until
+            // the camera returns (e.g. after a physical power cycle).
+            if watchdog_secs > 0 && last_packet.elapsed() >= Duration::from_secs(watchdog_secs) {
+                eprintln!(
+                    "[watchdog] No USB data for {}s — attempting recovery (drop, software re-plug, re-open)…",
+                    last_packet.elapsed().as_secs()
+                );
+                device = None; // drop the wedged handle before re-plugging
+                run_recovery_scripts();
+                let configuration = shared_ingester.configuration.lock().unwrap().clone();
+                let recovered = neuromorphic_drivers::flag_and_event_loop()
+                    .map_err(|e| format!("event loop: {e:?}"))
+                    .and_then(|(new_flag, event_loop)| {
+                        prophesee_evk4::open(
+                            neuromorphic_drivers::SerialOrBusNumberAndAddress::None,
+                            configuration,
+                            &prophesee_evk4::DEFAULT_USB_CONFIGURATION,
+                            event_loop,
+                            new_flag.clone(),
+                        )
+                        .map(|d| (new_flag, d))
+                        .map_err(|e| format!("open: {e:?}"))
+                    });
+                match recovered {
+                    Ok((new_flag, d)) => {
+                        device = Some(d);
+                        flag = new_flag;
+                        eprintln!("[watchdog] Recovery succeeded — streaming resumed.");
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[watchdog] Re-open failed ({e}) — retrying every {watchdog_secs}s until the camera returns."
+                        );
+                    }
+                }
+                last_packet = Instant::now();
+            } else if device.is_none() {
+                // Device-less between recovery attempts — don't spin.
+                thread::sleep(Duration::from_millis(200));
             }
         }
     });
