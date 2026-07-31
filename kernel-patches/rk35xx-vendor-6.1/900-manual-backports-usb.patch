@@ -1,0 +1,226 @@
+From: Manual backport (eventide) <eventide@localhost>
+Date: Fri, 31 Jul 2026 00:00:00 +0000
+Subject: Consolidated manual backports: xHCI Stop Endpoint hardening and
+ EP-context cycle bit fix (vendor 6.1.115 / rk-6.1-rkr5.1)
+
+This patch consolidates the hand-ported parts of the upstream fixes listed
+below for the Armbian/Rockchip vendor kernel 6.1.115 (RK3588). It was
+generated with "git diff" after applying, in order, the clean userpatches
+001, 002, 004, 008, 010, 011, 014, 015 and then the hand ports, so it
+applies cumulatively on top of those eight patches.
+
+Backported upstream commits:
+  42b758137601 ("usb: xhci: Limit Stop Endpoint retries")
+  474538b8dd1c ("usb: xhci: Avoid queuing redundant Stop Endpoint commands")
+  e21ebe51af68 ("xhci: Turn NEC specific quirk for handling Stop Endpoint errors generic")
+  6328bdc988d2 ("usb: xhci: Don't trust the EP Context cycle bit when moving HW dequeue")
+
+Dropped (not included here):
+  fbcbffbac994 ("phy: rockchip: naneng-combphy: fix phy reset")
+    Already present in substance: the vendor combphy driver fetches resets
+    individually by name (devm_reset_control_get_optional(dev, "combphy") /
+    "combphy-apb") and only (de)asserts the phy reset in the PHY init/exit
+    paths. The upstream commit message explicitly describes its fix as "what
+    the vendor kernel does", i.e. this vendor driver is the reference.
+  3126ea9be66b ("phy: rockchip: naneng-combphy: compatible reset with old DT")
+    Only relevant on top of fbcbffbac994: it adds a fallback for mainline DTs
+    that lack reset-names. The vendor driver never used the unnamed
+    reset-control-array API and vendor DTs (e.g. rk3588s.dtsi) always provide
+    reset-names = "combphy-apb", "combphy", so there is nothing to fall back
+    from.
+
+Deviations from upstream in this backport:
+  * 6328bdc988d2: vendor struct xhci_td still uses ->last_trb (upstream
+    renamed it to ->end_trb); ported with last_trb, logic otherwise identical.
+  * 474538b8dd1c: the xhci.h declaration of xhci_process_cancelled_tds() is
+    placed after count_trbs() because the vendor tree has no
+    xhci_stop_endpoint_sync() declaration (the upstream anchor point).
+  * 42b758137601: applied on top of fd9d55d190c0 (004-...patch) as upstream;
+    no content changes needed once 004 is in place.
+  * e21ebe51af68: applied verbatim once 42b758137601 is in place.
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index dba758326..246ecdbd1 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -52,6 +52,7 @@
+  *   endpoint rings; it generates events on the event ring for these.
+  */
+ 
++#include <linux/jiffies.h>
+ #include <linux/scatterlist.h>
+ #include <linux/slab.h>
+ #include <linux/dma-mapping.h>
+@@ -597,7 +598,7 @@ static int xhci_move_dequeue_past_td(struct xhci_hcd *xhci,
+ 	int new_cycle;
+ 	dma_addr_t addr;
+ 	u64 hw_dequeue;
+-	bool cycle_found = false;
++	bool hw_dequeue_found = false;
+ 	bool td_last_trb_found = false;
+ 	u32 trb_sct = 0;
+ 	int ret;
+@@ -632,25 +633,24 @@ static int xhci_move_dequeue_past_td(struct xhci_hcd *xhci,
+ 	hw_dequeue = xhci_get_hw_deq(xhci, dev, ep_index, stream_id);
+ 	new_seg = ep_ring->deq_seg;
+ 	new_deq = ep_ring->dequeue;
+-	new_cycle = hw_dequeue & 0x1;
++	new_cycle = le32_to_cpu(td->last_trb->generic.field[3]) & TRB_CYCLE;
+ 
+ 	/*
+-	 * We want to find the pointer, segment and cycle state of the new trb
+-	 * (the one after current TD's last_trb). We know the cycle state at
+-	 * hw_dequeue, so walk the ring until both hw_dequeue and last_trb are
+-	 * found.
++	 * Walk the ring until both the next TRB and hw_dequeue are found (don't
++	 * move hw_dequeue back if it went forward due to a HW bug). Cycle state
++	 * is loaded from a known good TRB, track later toggles to maintain it.
+ 	 */
+ 	do {
+-		if (!cycle_found && xhci_trb_virt_to_dma(new_seg, new_deq)
++		if (!hw_dequeue_found && xhci_trb_virt_to_dma(new_seg, new_deq)
+ 		    == (dma_addr_t)(hw_dequeue & ~0xf)) {
+-			cycle_found = true;
++			hw_dequeue_found = true;
+ 			if (td_last_trb_found)
+ 				break;
+ 		}
+ 		if (new_deq == td->last_trb)
+ 			td_last_trb_found = true;
+ 
+-		if (cycle_found && trb_is_link(new_deq) &&
++		if (td_last_trb_found && trb_is_link(new_deq) &&
+ 		    link_trb_toggles_cycle(new_deq))
+ 			new_cycle ^= 0x1;
+ 
+@@ -662,7 +662,7 @@ static int xhci_move_dequeue_past_td(struct xhci_hcd *xhci,
+ 			return -EINVAL;
+ 		}
+ 
+-	} while (!cycle_found || !td_last_trb_found);
++	} while (!hw_dequeue_found || !td_last_trb_found);
+ 
+ deq_found:
+ 
+@@ -1053,6 +1053,19 @@ static int xhci_invalidate_cancelled_tds(struct xhci_virt_ep *ep)
+ 	return 0;
+ }
+ 
++/*
++ * Erase queued TDs from transfer ring(s) and give back those the xHC didn't
++ * stop on. If necessary, queue commands to move the xHC off cancelled TDs it
++ * stopped on. Those will be given back later when the commands complete.
++ *
++ * Call under xhci->lock on a stopped endpoint.
++ */
++void xhci_process_cancelled_tds(struct xhci_virt_ep *ep)
++{
++	xhci_invalidate_cancelled_tds(ep);
++	xhci_giveback_invalidated_tds(ep);
++}
++
+ /*
+  * Returns the TD the endpoint ring halted on.
+  * Only call for non-running rings without streams.
+@@ -1145,16 +1158,33 @@ static void xhci_handle_cmd_stop_ep(struct xhci_hcd *xhci, int slot_id,
+ 			return;
+ 		case EP_STATE_STOPPED:
+ 			/*
+-			 * NEC uPD720200 sometimes sets this state and fails with
+-			 * Context Error while continuing to process TRBs.
+-			 * Be conservative and trust EP_CTX_STATE on other chips.
++			 * Per xHCI 4.6.9, Stop Endpoint command on a Stopped
++			 * EP is a Context State Error, and EP stays Stopped.
++			 *
++			 * But maybe it failed on Halted, and somebody ran Reset
++			 * Endpoint later. EP state is now Stopped and EP_HALTED
++			 * still set because Reset EP handler will run after us.
++			 */
++			if (ep->ep_state & EP_HALTED)
++				break;
++			/*
++			 * On some HCs EP state remains Stopped for some tens of
++			 * us to a few ms or more after a doorbell ring, and any
++			 * new Stop Endpoint fails without aborting the restart.
++			 * This handler may run quickly enough to still see this
++			 * Stopped state, but it will soon change to Running.
++			 *
++			 * Assume this bug on unexpected Stop Endpoint failures.
++			 * Keep retrying until the EP starts and stops again, on
++			 * chips where this is known to help. Wait for 100ms.
+ 			 */
+-			if (!(xhci->quirks & XHCI_NEC_HOST))
++			if (time_is_before_jiffies(ep->stop_time + msecs_to_jiffies(100)))
+ 				break;
+ 			fallthrough;
+ 		case EP_STATE_RUNNING:
+ 			/* Race, HW handled stop ep cmd before ep was running */
+-			xhci_dbg(xhci, "Stop ep completion ctx error, ep is running\n");
++			xhci_dbg(xhci, "Stop ep completion ctx error, ctx_state %d\n",
++					GET_EP_CTX_STATE(ep_ctx));
+ 
+ 			command = xhci_alloc_command(xhci, false, GFP_ATOMIC);
+ 			if (!command) {
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index f8bcf486e..e178c0de2 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -8,6 +8,7 @@
+  * Some code borrowed from the Linux EHCI driver.
+  */
+ 
++#include <linux/jiffies.h>
+ #include <linux/pci.h>
+ #include <linux/iommu.h>
+ #include <linux/iopoll.h>
+@@ -1905,15 +1906,27 @@ static int xhci_urb_dequeue(struct usb_hcd *hcd, struct urb *urb, int status)
+ 		}
+ 	}
+ 
+-	/* Queue a stop endpoint command, but only if this is
+-	 * the first cancellation to be handled.
+-	 */
+-	if (!(ep->ep_state & EP_STOP_CMD_PENDING)) {
++	/* These completion handlers will sort out cancelled TDs for us */
++	if (ep->ep_state & (EP_STOP_CMD_PENDING | EP_HALTED | SET_DEQ_PENDING)) {
++		xhci_dbg(xhci, "Not queuing Stop Endpoint on slot %d ep %d in state 0x%x\n",
++				urb->dev->slot_id, ep_index, ep->ep_state);
++		goto done;
++	}
++
++	/* In this case no commands are pending but the endpoint is stopped */
++	if (ep->ep_state & EP_CLEARING_TT) {
++		/* and cancelled TDs can be given back right away */
++		xhci_dbg(xhci, "Invalidating TDs instantly on slot %d ep %d in state 0x%x\n",
++				urb->dev->slot_id, ep_index, ep->ep_state);
++		xhci_process_cancelled_tds(ep);
++	} else {
++		/* Otherwise, queue a new Stop Endpoint command */
+ 		command = xhci_alloc_command(xhci, false, GFP_ATOMIC);
+ 		if (!command) {
+ 			ret = -ENOMEM;
+ 			goto done;
+ 		}
++		ep->stop_time = jiffies;
+ 		ep->ep_state |= EP_STOP_CMD_PENDING;
+ 		xhci_queue_stop_endpoint(xhci, command, urb->dev->slot_id,
+ 					 ep_index, 0);
+diff --git a/drivers/usb/host/xhci.h b/drivers/usb/host/xhci.h
+index aa747365b..358a6c52c 100644
+--- a/drivers/usb/host/xhci.h
++++ b/drivers/usb/host/xhci.h
+@@ -717,6 +717,7 @@ struct xhci_virt_ep {
+ 	/* Bandwidth checking storage */
+ 	struct xhci_bw_info	bw_info;
+ 	struct list_head	bw_endpoint_list;
++	unsigned long		stop_time;
+ 	/* Isoch Frame ID checking storage */
+ 	int			next_frame_id;
+ 	/* Use new Isoch TRB layout needed for extended TBC support */
+@@ -1952,6 +1953,7 @@ void xhci_ring_doorbell_for_active_rings(struct xhci_hcd *xhci,
+ void xhci_cleanup_command_queue(struct xhci_hcd *xhci);
+ void inc_deq(struct xhci_hcd *xhci, struct xhci_ring *ring);
+ unsigned int count_trbs(u64 addr, u64 len);
++void xhci_process_cancelled_tds(struct xhci_virt_ep *ep);
+ 
+ /* xHCI roothub code */
+ void xhci_set_link_state(struct xhci_hcd *xhci, struct xhci_port *port,

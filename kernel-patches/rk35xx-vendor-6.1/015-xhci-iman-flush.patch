@@ -1,0 +1,60 @@
+From f5bce30ad25e74899c54dda01c80ca6e2e7dc01b Mon Sep 17 00:00:00 2001
+From: Niklas Neronin <niklas.neronin@linux.intel.com>
+Date: Thu, 15 May 2025 16:56:13 +0300
+Subject: usb: xhci: guarantee that IMAN register is flushed
+
+Add read call to guarantee that the write to the IMAN register has
+been flushed.
+
+xHCI specification 1.2, section 5.5.2.1, Note:
+"Most systems have write buffers that minimize overhead, but this may
+ require a read operation to guarantee that the write has been flushed
+ from the posted buffer."
+
+Signed-off-by: Niklas Neronin <niklas.neronin@linux.intel.com>
+Signed-off-by: Mathias Nyman <mathias.nyman@linux.intel.com>
+Link: https://lore.kernel.org/r/20250515135621.335595-17-mathias.nyman@linux.intel.com
+Signed-off-by: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+---
+ drivers/usb/host/xhci-ring.c | 3 +++
+ drivers/usb/host/xhci.c      | 3 +++
+ 2 files changed, 6 insertions(+)
+
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index d2002ecd27b00..4a4410f7978f3 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -3087,6 +3087,9 @@ static void xhci_clear_interrupt_pending(struct xhci_interrupter *ir)
+ 		irq_pending = readl(&ir->ir_set->irq_pending);
+ 		irq_pending |= IMAN_IP;
+ 		writel(irq_pending, &ir->ir_set->irq_pending);
++
++		/* Read operation to guarantee the write has been flushed from posted buffers */
++		readl(&ir->ir_set->irq_pending);
+ 	}
+ }
+ 
+diff --git a/drivers/usb/host/xhci.c b/drivers/usb/host/xhci.c
+index 472589679af39..8cdb1a01a3edf 100644
+--- a/drivers/usb/host/xhci.c
++++ b/drivers/usb/host/xhci.c
+@@ -335,6 +335,8 @@ int xhci_enable_interrupter(struct xhci_interrupter *ir)
+ 	iman |= IMAN_IE;
+ 	writel(iman, &ir->ir_set->irq_pending);
+ 
++	/* Read operation to guarantee the write has been flushed from posted buffers */
++	readl(&ir->ir_set->irq_pending);
+ 	return 0;
+ }
+ 
+@@ -350,6 +352,7 @@ int xhci_disable_interrupter(struct xhci_interrupter *ir)
+ 	iman &= ~IMAN_IE;
+ 	writel(iman, &ir->ir_set->irq_pending);
+ 
++	readl(&ir->ir_set->irq_pending);
+ 	return 0;
+ }
+ 
+-- 
+cgit 1.3-korg
+
