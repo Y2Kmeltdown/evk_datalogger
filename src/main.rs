@@ -710,7 +710,11 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
     let file_interval = Duration::from_secs(args.file_length);
 
     // ── Channels ──────────────────────────────────────────────────────────────
-    let (tx, rx) = mpsc::channel::<OwnedPacket>();
+    // Bounded: caps memory when the processor falls behind the USB stream
+    // (each packet is up to 128 KiB). An unbounded queue here lets a decode
+    // backlog grow until the OOM killer kills the process; with a bound, the
+    // ingester keeps draining USB and drops packets instead (counted below).
+    let (tx, rx) = mpsc::sync_channel::<OwnedPacket>(2048);
     // API → ingester: full device configurations to apply at runtime.
     let (config_tx, config_rx) = mpsc::channel::<prophesee_evk4::Configuration>();
 
@@ -910,6 +914,7 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
 
     // ── Ingestion thread ──────────────────────────────────────────────────────
     let ingester = thread::spawn(move || {
+        let mut dropped_packets: u64 = 0;
         loop {
             // Apply pending device configuration updates from the HTTP API.
             // Runs before each read, so updates land within one timeout period.
@@ -937,9 +942,22 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
                     index_data,
                 };
 
-                if tx.send(packet).is_err() {
-                    eprintln!("[ingester] Receiver gone — stopping ingestion.");
-                    break;
+                match tx.try_send(packet) {
+                    Ok(()) => {}
+                    Err(mpsc::TrySendError::Full(_)) => {
+                        // Processor is backlogged — drop rather than grow the
+                        // queue without bound (which ends in an OOM kill).
+                        dropped_packets += 1;
+                        if dropped_packets % 1024 == 1 {
+                            eprintln!(
+                                "[ingester] Processor backlogged — dropped {dropped_packets} packets so far."
+                            );
+                        }
+                    }
+                    Err(mpsc::TrySendError::Disconnected(_)) => {
+                        eprintln!("[ingester] Receiver gone — stopping ingestion.");
+                        break;
+                    }
                 }
             }
 
