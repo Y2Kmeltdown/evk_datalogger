@@ -156,10 +156,19 @@
       "default": true,
       "socket": "http_api",
       "fields": [
-        {"key": "events_per_second", "label": "Rate limit (ev/s, 0 = unlimited)", "kind": "number", "min": 0, "get": "/api/rate-limit", "put": "/api/rate-limit"},
         {"key": "max_age_secs", "label": "Buffer max age (s)", "kind": "number", "min": 0, "get": "/api/buffer", "put": "/api/buffer"},
         {"key": "max_bytes", "label": "Buffer max bytes", "kind": "number", "min": 0, "get": "/api/buffer", "put": "/api/buffer"}
       ]
+    },
+    {
+      "id": "record-control",
+      "type": "recording",
+      "title": "EVK4 RECORD",
+      "region": "sidebar",
+      "default": true,
+      "socket": "http_api",
+      "get": "/api/recording",
+      "put": "/api/recording"
     },
     {
       "id": "rec-status",
