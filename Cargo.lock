@@ -351,8 +351,7 @@ dependencies = [
 [[package]]
 name = "neuromorphic-drivers"
 version = "0.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "842fafc5222dbec49ae15f9d7b11f29e7c8e496e0db226e041d150283a6b3718"
+source = "git+https://github.com/Y2Kmeltdown/neuromorphic-drivers.git?branch=IDS-uEye-XLS-E-Support#b5a91066ba87f63b34f777cdbbfaff70b340bdf5"
 dependencies = [
  "bincode",
  "libc",

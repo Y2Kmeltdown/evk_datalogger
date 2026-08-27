@@ -22,3 +22,6 @@ path = "src/bin/viewfinder.rs"
 [[bin]]
 name = "replay"
 path = "src/bin/replay.rs"
+
+[patch.crates-io]
+neuromorphic-drivers = { git = "https://github.com/Y2Kmeltdown/neuromorphic-drivers.git", branch = "IDS-uEye-XLS-E-Support"}
