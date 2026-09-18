@@ -84,6 +84,16 @@ struct Args {
     #[arg(long, default_value_os_t = default_tmp_dir().join("evk4_raw"))]
     output_dir: PathBuf,
 
+    /// Stage each chunk here (expected to be on the OS drive, fast) and
+    /// migrate it to --output-dir in the background as soon as it rolls
+    /// over / recording stops, instead of writing straight to --output-dir.
+    /// The NEXT chunk starts recording immediately — migration of the
+    /// finished one runs concurrently on its own thread, so a slow
+    /// --output-dir (e.g. an SD card) never blocks real-time ingestion.
+    /// Unset (default): write directly to --output-dir, as before.
+    #[arg(long)]
+    tmp_output_dir: Option<PathBuf>,
+
     /// How often (in seconds) to roll over to a new raw file while recording
     #[arg(long, default_value_t = 60)]
     file_length: u64,
@@ -217,6 +227,49 @@ fn open_raw_file(dir: &Path) -> (PathBuf, std::fs::File) {
         .open(&path)
         .unwrap_or_else(|e| panic!("Failed to open raw file {}: {e}", path.display()));
     (path, file)
+}
+
+/// An empty string (e.g. from the dashboard's argument-edit form, or the
+/// manifest default with its `{module_dir}/tmp_recordings` placeholder
+/// blanked out) means "disabled", same as omitting the flag entirely —
+/// clap would otherwise parse it as `Some(PathBuf::from(""))`, which is
+/// not what an empty value is meant to express here.
+fn normalize_tmp_output_dir(dir: Option<PathBuf>) -> Option<PathBuf> {
+    dir.filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Where `write_path` (opened under whatever directory we're actually
+/// writing into — the tmp staging dir when enabled, output_dir otherwise)
+/// should end up once complete: same filename, under the true output_dir.
+/// A no-op when not staging, since write_path is already under output_dir.
+fn final_destination(output_dir: &Path, write_path: &Path) -> PathBuf {
+    output_dir.join(
+        write_path
+            .file_name()
+            .expect("a path returned by open_raw_file always has a filename"),
+    )
+}
+
+/// Copies `src` to `dest` (same contract as the basler-camera module's
+/// Python migration worker): via a `.part` sibling of `dest` under its
+/// final destination directory (so the closing rename is always same-
+/// filesystem and therefore atomic — the recordings browser never sees a
+/// partially-copied file under its real name), then removes `src`. On
+/// failure, `src` is left untouched (recoverable — re-queued on next
+/// startup, see main()'s leftover scan) and any partial `.part` is removed
+/// so it's never mistaken for a finished recording.
+fn migrate_file(src: &Path, dest: &Path) -> std::io::Result<()> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let part = PathBuf::from(format!("{}.part", dest.to_string_lossy()));
+    if let Err(e) = std::fs::copy(src, &part) {
+        let _ = std::fs::remove_file(&part);
+        return Err(e);
+    }
+    std::fs::rename(&part, dest)?;
+    std::fs::remove_file(src)?;
+    Ok(())
 }
 
 /// Try to write a length-prefixed binary message to a stream.
@@ -662,7 +715,8 @@ fn run_http_server(
 // ── Main ──────────────────────────────────────────────────────────────────────
 
 fn main() -> Result<(), neuromorphic_drivers::Error> {
-    let args = Args::parse();
+    let mut args = Args::parse();
+    args.tmp_output_dir = normalize_tmp_output_dir(args.tmp_output_dir);
 
     // ── Unix socket setup ─────────────────────────────────────────────────────
     let _ = std::fs::remove_file(&args.events_socket);
@@ -683,6 +737,10 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
     println!("[main] Events socket:    {}", args.events_socket.display());
     println!("[main] Triggers socket:  {}", args.triggers_socket.display());
     println!("[main] Output directory: {}", args.output_dir.display());
+    match &args.tmp_output_dir {
+        Some(dir) => println!("[main] Staging chunks in: {} (migrated to output dir on rollover/stop)", dir.display()),
+        None => println!("[main] Staging:           disabled (writing directly to output dir)"),
+    }
     println!("[main] File interval:    {}s", args.file_length);
     println!(
         "[main] Circular buffer:  {}s / {} bytes cap",
@@ -748,7 +806,48 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
     });
 
     let output_dir = args.output_dir.clone();
+    let write_dir = args.tmp_output_dir.clone().unwrap_or_else(|| output_dir.clone());
     let file_interval = Duration::from_secs(args.file_length);
+
+    // ── Staged recording (--tmp-output-dir) ─────────────────────────────────────
+    // Chunks are written to write_dir (the tmp dir when staging, output_dir
+    // otherwise) and, when staging, handed to this background thread to copy
+    // over to output_dir as soon as each one closes — the processor opens the
+    // next chunk immediately rather than waiting for the copy.
+    let migrate_tx: Option<mpsc::Sender<(PathBuf, PathBuf)>> = if let Some(tmp_dir) = &args.tmp_output_dir {
+        std::fs::create_dir_all(tmp_dir)
+            .unwrap_or_else(|e| panic!("Failed to create tmp output directory {}: {e}", tmp_dir.display()));
+        let (tx, rx) = mpsc::channel::<(PathBuf, PathBuf)>();
+
+        // Recover anything left behind by an unclean shutdown (crash, power
+        // loss) between a chunk finishing and its migration — never
+        // silently strand footage sitting in the tmp dir.
+        if let Ok(read_dir) = std::fs::read_dir(tmp_dir) {
+            for entry in read_dir.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("raw") {
+                    let dest = final_destination(&output_dir, &path);
+                    println!(
+                        "[migrate] found leftover staged recording {}, re-queuing migration",
+                        path.display()
+                    );
+                    let _ = tx.send((path, dest));
+                }
+            }
+        }
+
+        thread::spawn(move || {
+            while let Ok((src, dest)) = rx.recv() {
+                match migrate_file(&src, &dest) {
+                    Ok(()) => println!("[migrate] migrated {} -> {}", src.display(), dest.display()),
+                    Err(e) => eprintln!("[migrate] failed to migrate {}: {e}", src.display()),
+                }
+            }
+        });
+        Some(tx)
+    } else {
+        None
+    };
 
     // ── Channels ──────────────────────────────────────────────────────────────
     // Bounded: caps memory when the processor falls behind the USB stream
@@ -778,6 +877,11 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
 
         // Recording is off until the API enables it — no file is open.
         let mut raw_file: Option<std::fs::File> = None;
+        // Where raw_file is actually writing (write_dir) — tracked
+        // separately from shared.current_file, which always reports the
+        // true final destination (output_dir) even while staging, so API/
+        // dashboard consumers never see an internal implementation detail.
+        let mut raw_write_path: Option<PathBuf> = None;
         let mut last_rollover = Instant::now();
 
         let mut circular = CircularBuffer::new();
@@ -810,7 +914,7 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
                 // pre-roll, so the recording includes the moments *before*
                 // the record command. The current packet is not in the buffer
                 // yet, so nothing is written twice.
-                let (path, mut file) = open_raw_file(&output_dir);
+                let (path, mut file) = open_raw_file(&write_dir);
                 let mut preroll_bytes = 0usize;
                 for (_, data) in &circular.chunks {
                     if let Err(e) = file.write_all(data) {
@@ -826,20 +930,36 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
                 } else {
                     println!("[processor] Recording started (buffer empty — no pre-roll).");
                 }
-                *shared.current_file.lock().unwrap() = Some(path);
+                *shared.current_file.lock().unwrap() = Some(final_destination(&output_dir, &path));
+                raw_write_path = Some(path);
                 raw_file = Some(file);
                 last_rollover = Instant::now();
             } else if !recording && raw_file.is_some() {
-                // Falling edge — close the file.
+                // Falling edge — close the file, then hand the finished
+                // chunk off for migration (if staging) rather than waiting
+                // here for a slow output_dir.
                 raw_file = None;
                 *shared.current_file.lock().unwrap() = None;
+                if let (Some(tx), Some(write_path)) = (&migrate_tx, raw_write_path.take()) {
+                    let dest = final_destination(&output_dir, &write_path);
+                    let _ = tx.send((write_path, dest));
+                }
                 println!("[processor] Recording stopped — file closed.");
             }
 
-            // ── File rollover (only while recording) ──────────────────────────
+            // ── File rollover (only while recording) ────────────────────────────
+            // Hand the just-finished chunk off for migration BEFORE opening
+            // the next one, so the next chunk starts recording immediately
+            // while the previous one copies over in the background — a
+            // slow output_dir never blocks real-time ingestion.
             if raw_file.is_some() && last_rollover.elapsed() >= file_interval {
-                let (path, file) = open_raw_file(&output_dir);
-                *shared.current_file.lock().unwrap() = Some(path);
+                if let (Some(tx), Some(old_write_path)) = (&migrate_tx, raw_write_path.take()) {
+                    let dest = final_destination(&output_dir, &old_write_path);
+                    let _ = tx.send((old_write_path, dest));
+                }
+                let (path, file) = open_raw_file(&write_dir);
+                *shared.current_file.lock().unwrap() = Some(final_destination(&output_dir, &path));
+                raw_write_path = Some(path);
                 raw_file = Some(file);
                 last_rollover = Instant::now();
             }
@@ -1069,4 +1189,140 @@ fn main() -> Result<(), neuromorphic_drivers::Error> {
 
     println!("[main] Pipeline complete.");
     Ok(())
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::{final_destination, migrate_file, normalize_tmp_output_dir};
+    use std::path::PathBuf;
+
+    #[test]
+    fn normalize_tmp_output_dir_treats_empty_string_as_disabled() {
+        assert_eq!(normalize_tmp_output_dir(Some(PathBuf::from(""))), None);
+    }
+
+    #[test]
+    fn normalize_tmp_output_dir_leaves_a_real_path_alone() {
+        let dir = PathBuf::from("/some/tmp/dir");
+        assert_eq!(normalize_tmp_output_dir(Some(dir.clone())), Some(dir));
+    }
+
+    #[test]
+    fn normalize_tmp_output_dir_leaves_none_alone() {
+        assert_eq!(normalize_tmp_output_dir(None), None);
+    }
+
+    /// A fresh, self-cleaning temp directory for one test — avoids pulling
+    /// in a dev-dependency just for this.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "evk_datalogger_test_{tag}_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            TempDir(dir)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn final_destination_keeps_filename_swaps_directory() {
+        let output_dir = PathBuf::from("/recordings/evk");
+        let write_path = PathBuf::from("/tmp/evk_staging/20260918T090000Z_evk.raw");
+        let dest = final_destination(&output_dir, &write_path);
+        assert_eq!(dest, PathBuf::from("/recordings/evk/20260918T090000Z_evk.raw"));
+    }
+
+    #[test]
+    fn final_destination_is_a_no_op_when_not_staging() {
+        // When staging is disabled, write_dir == output_dir, so write_path
+        // is already under output_dir — final_destination must return it
+        // unchanged rather than double-joining.
+        let output_dir = PathBuf::from("/recordings/evk");
+        let write_path = output_dir.join("20260918T090000Z_evk.raw");
+        assert_eq!(final_destination(&output_dir, &write_path), write_path);
+    }
+
+    #[test]
+    fn migrate_file_copies_content_and_removes_source() {
+        let tmp = TempDir::new("migrate_ok");
+        let src_dir = tmp.path().join("staging");
+        let dest_dir = tmp.path().join("final");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        // dest_dir intentionally NOT created — migrate_file must create it.
+
+        let src = src_dir.join("chunk.raw");
+        let dest = dest_dir.join("chunk.raw");
+        std::fs::write(&src, b"some raw event bytes").unwrap();
+
+        migrate_file(&src, &dest).unwrap();
+
+        assert!(!src.exists(), "source file removed after a successful migration");
+        assert!(dest.exists(), "destination file exists at the true final path");
+        assert!(!dest.with_file_name("chunk.raw.part").exists(), "no leftover .part file");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"some raw event bytes");
+    }
+
+    #[test]
+    fn migrate_file_preserves_source_on_failure() {
+        let tmp = TempDir::new("migrate_fail");
+        let src_dir = tmp.path().join("staging");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src = src_dir.join("chunk.raw");
+        std::fs::write(&src, b"bytes that must not be lost").unwrap();
+
+        // A destination whose "directory" is actually an existing file:
+        // create_dir_all(dest.parent()) must fail, and migrate_file must
+        // propagate that failure rather than deleting the source.
+        let blocker = tmp.path().join("blocked");
+        std::fs::write(&blocker, b"i am a file, not a directory").unwrap();
+        let dest = blocker.join("chunk.raw");
+
+        let result = migrate_file(&src, &dest);
+
+        assert!(result.is_err(), "migrate_file reports the failure instead of pretending to succeed");
+        assert!(src.exists(), "source is preserved (recoverable) when migration fails");
+        assert!(!dest.exists(), "nothing appears at the destination on failure");
+    }
+
+    #[test]
+    fn migrate_file_pipelines_next_chunk_while_previous_one_would_still_be_copying() {
+        // Simulates the actual usage pattern: the processor thread hands a
+        // finished chunk to the migration channel and immediately opens the
+        // next chunk (a fresh, empty write path) without waiting — this
+        // just confirms two independent chunks migrate correctly to
+        // distinct destinations when queued back-to-back, which is what
+        // the mpsc channel + background thread in main() relies on.
+        let tmp = TempDir::new("pipeline");
+        let src_dir = tmp.path().join("staging");
+        let dest_dir = tmp.path().join("final");
+        std::fs::create_dir_all(&src_dir).unwrap();
+
+        let src1 = src_dir.join("20260918T090000Z_evk.raw");
+        let src2 = src_dir.join("20260918T090100Z_evk.raw");
+        std::fs::write(&src1, b"chunk one").unwrap();
+        std::fs::write(&src2, b"chunk two").unwrap();
+
+        let dest1 = final_destination(&dest_dir, &src1);
+        let dest2 = final_destination(&dest_dir, &src2);
+        migrate_file(&src1, &dest1).unwrap();
+        migrate_file(&src2, &dest2).unwrap();
+
+        assert_eq!(std::fs::read(&dest1).unwrap(), b"chunk one");
+        assert_eq!(std::fs::read(&dest2).unwrap(), b"chunk two");
+        assert!(!src1.exists() && !src2.exists());
+    }
 }

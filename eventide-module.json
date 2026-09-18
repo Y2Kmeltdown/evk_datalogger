@@ -28,6 +28,14 @@
       "description": "Seconds before rolling over to a new raw recording file."
     },
     {
+      "name": "tmp_output_dir",
+      "flag": "--tmp-output-dir",
+      "type": "str",
+      "default": "{module_dir}/tmp_recordings",
+      "required": false,
+      "description": "Stage each chunk here (on the OS drive, alongside the module itself) and migrate it to the true recordings directory in the background as soon as it rolls over or recording stops — the next chunk starts immediately rather than waiting for the copy. Needed when the recordings directory is a slower device (e.g. an SD card) that can't sustain the camera's raw write rate. Set to an empty string to write directly to the recordings directory instead (the old behaviour)."
+    },
+    {
       "name": "rate_limit",
       "flag": "--rate-limit",
       "type": "int",
@@ -190,7 +198,7 @@
   "programs": [
     {
       "name": "event_based_camera",
-      "command": "{install_dir}/evk_datalogger --output-dir {recordings_subdir} --events-socket {socket:events} --triggers-socket {socket:triggers} --file-length {arg:file_length} --rate-limit {arg:rate_limit} --diff-on {arg:diff_on} --diff-off {arg:diff_off} --api-bind 0.0.0.0:{socket:http_api} --buffer-max-age {arg:buffer_max_age} --buffer-max-bytes {arg:buffer_max_bytes} --record-toggle {arg:record_toggle}",
+      "command": "{install_dir}/evk_datalogger --output-dir {recordings_subdir} --tmp-output-dir {arg:tmp_output_dir} --events-socket {socket:events} --triggers-socket {socket:triggers} --file-length {arg:file_length} --rate-limit {arg:rate_limit} --diff-on {arg:diff_on} --diff-off {arg:diff_off} --api-bind 0.0.0.0:{socket:http_api} --buffer-max-age {arg:buffer_max_age} --buffer-max-bytes {arg:buffer_max_bytes} --record-toggle {arg:record_toggle}",
       "directory": "{install_dir}",
       "autostart": true,
       "autorestart": true,

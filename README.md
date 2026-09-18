@@ -15,6 +15,20 @@ installs `requirements.txt` into it, installs the neuromorphic-drivers udev
 rules, builds with `cargo build --release`, copies the binaries to
 `/usr/local/eventide/code/`, and registers both services with supervisord.
 
+Because raw event data can arrive faster than some destinations can absorb
+it (an SD card in particular), `event_based_camera` stages each chunk to
+`--tmp-output-dir` — `{module_dir}/tmp_recordings` by default, i.e. on the
+OS drive alongside the module itself — and migrates it to the true
+recordings directory on a background thread as soon as it rolls over (see
+`--file-length`) or recording stops. The *next* chunk starts recording
+immediately; it doesn't wait for the previous one to finish copying, so a
+slow recordings directory never blocks real-time ingestion. If the process
+restarts with a chunk still sitting in the tmp directory (an unclean
+shutdown mid-copy), it's picked up and migrated again on the next start —
+nothing is silently lost. Set `tmp_output_dir` to an empty string (via the
+dashboard's module-edit form, or `--tmp-output-dir ""`) to write directly to
+the recordings directory instead, as before.
+
 ## Installation (standalone)
 First you need to install rust follow instructions on [rust website](https://rust-lang.org/tools/install/).
 
