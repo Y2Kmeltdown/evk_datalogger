@@ -46,7 +46,7 @@ use std::time::{Duration, Instant};
 use neuromorphic_drivers::prophesee_evk4;
 use neuromorphic_drivers::UsbDevice;
 
-use chrono::Utc;
+use chrono::Local;
 use clap::Parser;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
@@ -208,9 +208,10 @@ struct OwnedPacket {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-/// Build a timestamped filename inside `dir`, e.g. `20240315T123456Z_evk.raw`.
+/// Build a timestamped filename inside `dir`, e.g. `20240315T123456_evk.raw`
+/// (system local time).
 fn timestamped_path(dir: &Path, ext: String) -> PathBuf {
-    let ts = Utc::now().format("%Y%m%dT%H%M%SZ");
+    let ts = Local::now().format("%Y%m%dT%H%M%S");
     dir.join(format!("{ts}_evk{ext}"))
 }
 
