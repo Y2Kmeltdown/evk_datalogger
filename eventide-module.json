@@ -84,6 +84,14 @@
       "description": "JPEG quality for the live stream (1-100)."
     },
     {
+      "name": "rotate_view",
+      "flag": "--rotate",
+      "type": "str",
+      "default": "false",
+      "required": false,
+      "description": "Rotate the live MJPEG view (stream and snapshot) by 180 degrees: \"true\" or \"false\"."
+    },
+    {
       "name": "record_toggle",
       "flag": "--record-toggle",
       "type": "str",
@@ -208,7 +216,7 @@
     },
     {
       "name": "evk_mjpeg_server",
-      "command": "{install_dir}/viewfinder --bind 0.0.0.0:{socket:mjpeg} --events-socket {socket:events} --quality {arg:stream_quality}",
+      "command": "{install_dir}/viewfinder --bind 0.0.0.0:{socket:mjpeg} --events-socket {socket:events} --quality {arg:stream_quality} --rotate {arg:rotate_view}",
       "directory": "{install_dir}",
       "autostart": true,
       "autorestart": true,

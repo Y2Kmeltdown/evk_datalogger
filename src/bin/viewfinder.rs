@@ -86,6 +86,10 @@ struct Args {
     /// Unix socket path for the decoded DVS events
     #[arg(long, default_value_t = default_events_socket())]
     events_socket: String,
+
+    /// Rotate the view 180 degrees: "true" or "false"
+    #[arg(long, default_value = "false")]
+    rotate: String,
 }
 
 // ── Binary event layout (must match the Rust pipeline) ───────────────────────
@@ -320,6 +324,7 @@ fn main() {
     let width    = args.width;
     let height   = args.height;
     let n_pixels = (width * height) as usize;
+    let rotate   = args.rotate.to_lowercase() == "true";
     let frame_interval = Duration::from_nanos(1_000_000_000 / args.fps);
 
     // ── Shared state ──────────────────────────────────────────────────────────
@@ -512,6 +517,10 @@ fn main() {
                         {
                             let mut px = shared_pixels.lock().unwrap();
                             px.copy_from_slice(&grid);
+                            // A 180° rotation of a row-major image is a full reversal.
+                            if rotate {
+                                px.reverse();
+                            }
                         }
                         grid.fill(127);
                         last_frame_time = Instant::now();
